@@ -1,5 +1,5 @@
 /*!
- * 聊天文字调色 v1.1.6
+ * 聊天文字调色 v1.1.8
  * SillyTavern UI 扩展
  *
  * 功能：
@@ -8,25 +8,21 @@
  *    - 跟随酒馆主题（不做任何处理）
  *    - 纯色（可自定义颜色）
  *    - 渐变（自定义 2~4 个颜色，可调整渐变角度 0~360°）
- *      渐变带霓虹光晕开关与强度调节（逐字三层辉光，跟随每个字自己的颜色）
- * 3. 渐变粒度：主要文本 = 整条消息；斜体 = 按段落；引用 = 按引号对，
- *    六种引号（英文 ""、中文 “”、直角 「」、双直角 『』、法语 «»、全角 ＂＂）
- *    连同其中文字（含开闭引号）作为一个独立渐变循环。
+ *      渐变带霓虹光晕开关与强度调节（元素级多层 drop-shadow，参考「雨夜回响」）
+ * 3. 渐变粒度：主要文本 = 整条消息；斜体 = 每个 em 段落；引用 = 每个 q / blockquote 整段。
  * 4. 内置 10 套配色预设 + 3 套可保存的自定义预设。
  * 5. 设置面板跟随酒馆主题与字体大小，顶部横排文字类型标签切换。
  *
  * 性能设计：
- * - 离屏门控：仅对接近视口的消息做逐字染色（IntersectionObserver）。
- * - 流式生成期间以 CSS 近似色兜底（酒馆重建 DOM 时新文本立即着色、不闪烁），
- *   DOM 稳定后再补逐字精确，生成结束后统一按真实位置校正。
- * - 批量读取字符位置（一次布局后统一计算颜色），阴影字符串缓存。
+ * - 纯 CSS 元素级渲染（background-clip:text 渐变 + filter drop-shadow），
+ *   不逐字插入 span、不做逐字阴影，流式与最终渲染共用，无闪烁、无变色延迟。
  */
 (() => {
     'use strict';
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.1.7';
+    const VERSION = '1.1.8';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -173,7 +169,7 @@
 
     // 流式兜底光晕：参考「雨夜回响」主题，用多层 drop-shadow 跟随渐变文字轮廓发光。
     // 三层分别取渐变起点/中点/终点色（蓝段蓝光、白段白光、黄段黄光），强度同时缩放半径与透明度。
-    function streamGlowFilter(stops, strength) {
+    function glowFilter(stops, strength) {
         const s = Math.min(1, Math.max(0, (Number(strength) || 0) / 100));
         if (!(s > 0)) return 'none';
         const list = stopsOf({ stops });
@@ -208,7 +204,7 @@
             } else {
                 const stops = stopsOf(cfg);
                 const angle = Number.isFinite(Number(cfg.angle)) ? Number(cfg.angle) : 90;
-                const glow = cfg.glow ? streamGlowFilter(stops, cfg.strength) : 'none';
+                const glow = cfg.glow ? glowFilter(stops, cfg.strength) : 'none';
                 css += `${sel} { ${gradientTextCss(stops, angle)} text-shadow: none !important; filter: ${glow} !important; } `;
             }
         }
@@ -220,6 +216,54 @@
             }
         }
         return css;
+    }
+
+    // 某类文字的 CSS 声明（theme 返回空字符串）：
+    // 渐变走元素级 background-clip:text + 多层 drop-shadow（复刻「雨夜回响」），
+    // 不再使用逐字 span + text-shadow。方向由 CSS 的 linear-gradient 角度保证，中间色自然铺开。
+    function targetDecl(cfg) {
+        if (!cfg || cfg.mode === 'theme') return '';
+        if (cfg.mode === 'solid') {
+            const c = cfg.color || '#ffffff';
+            return `color:${c}!important;-webkit-text-fill-color:${c}!important;background:none!important;text-shadow:none!important;filter:none!important;`;
+        }
+        const stops = stopsOf(cfg);
+        const angle = Number.isFinite(Number(cfg.angle)) ? Number(cfg.angle) : 90;
+        const glow = cfg.glow ? glowFilter(stops, cfg.strength) : 'none';
+        return `background:linear-gradient(${angle}deg,${stops.join(',')})!important;-webkit-background-clip:text!important;background-clip:text!important;color:transparent!important;-webkit-text-fill-color:transparent!important;text-shadow:none!important;filter:${glow}!important;`;
+    }
+
+    // 生成完整动态配色 CSS：主要文本整条渐变，斜体按 em 段、引用按 q/blockquote 段渐变。
+    // 斜体与引用选择器特异性更高，自然覆盖主要文本；后声明者优先（斜体 > 引用 > 主要文本）。
+    function buildColorCss(s) {
+        const sel = {
+            main: '#chat .mes .mes_text',
+            italic: '#chat .mes .mes_text em',
+            quote: '#chat .mes .mes_text q, #chat .mes .mes_text blockquote',
+        };
+        let css = '';
+        for (const k of ['main', 'quote', 'italic']) {
+            const d = targetDecl(s && s[k]);
+            if (d) css += `${sel[k]}{${d}}`;
+        }
+        return css;
+    }
+
+    // 清除历史逐字染色 span，交给动态 CSS 接管（雨夜回响式）
+    function clearAllSpans() {
+        if (typeof document === 'undefined') return;
+        const els = [...document.querySelectorAll('#chat .mes [data-yyx]')];
+        for (const el of els) {
+            const kind = el.getAttribute('data-yyx');
+            if (kind !== 'ch' && kind !== 'sol') continue;
+            const p = el.parentNode;
+            if (p) p.replaceChild(document.createTextNode(el.textContent), el);
+        }
+        for (const m of document.querySelectorAll('#chat .mes')) {
+            delete m.dataset.yyx;
+            delete m.dataset.yyxRev;
+            delete m.dataset.yyxStream;
+        }
     }
 
     // 按字素拆分（避免 emoji 组合序列被拆坏）
@@ -431,21 +475,21 @@
 .yyx-pickbtn.yyx-active { outline: 1px solid var(--SmartThemeQuoteColor, rgba(255,255,255,.5)); }
 `;
         document.head.appendChild(st);
-        // 流式兜底样式表：酒馆流式期间重建 DOM 时，新文本立即获得近似色，消除「原生色→彩色」闪烁
-        let sa = document.getElementById('yyx-stream-approx');
-        if (!sa) {
-            sa = document.createElement('style');
-            sa.id = 'yyx-stream-approx';
-            document.head.appendChild(sa);
+        // 动态配色样式表：三类文字的元素级渐变/纯色 + drop-shadow 光晕（雨夜回响式），流式与最终渲染共用
+        let sc = document.getElementById('yyyx-color');
+        if (!sc) {
+            sc = document.createElement('style');
+            sc.id = 'yyyx-color';
+            document.head.appendChild(sc);
         }
-        sa.textContent = buildStreamCss(settings);
+        sc.textContent = buildColorCss(settings);
     }
 
-    // 设置变化时刷新流式兜底样式
-    function updateStreamCss() {
+    // 设置变化时刷新动态配色样式
+    function updateColorCss() {
         if (typeof document === 'undefined') return; // Node 纯函数测试环境
-        const sa = document.getElementById('yyx-stream-approx');
-        if (sa) sa.textContent = buildStreamCss(settings);
+        const sc = document.getElementById('yyyx-color');
+        if (sc) sc.textContent = buildColorCss(settings);
     }
 
     // ===== 染色引擎 =====
@@ -1184,8 +1228,8 @@
     function onChange() {
         saveNow();
         rev = JSON.stringify(settings);
-        updateStreamCss();
-        scheduleRepaint(250);
+        updateColorCss();
+        clearAllSpans();
     }
 
     function refreshAllUI() {
@@ -1259,14 +1303,14 @@
 
     // ===== 启动 =====
     function initChatHooks() {
+        // 纯 CSS 方案无需观察器：等待 chat 出现后清理一次历史 span 即可
         let tries = 0;
         const t = setInterval(() => {
             const c = document.getElementById('chat');
             if (c) {
                 clearInterval(t);
                 chat.el = c;
-                ensureObservers();
-                scheduleRepaint(400);
+                clearAllSpans();
                 return;
             }
             if (++tries > 200) clearInterval(t);
@@ -1284,7 +1328,7 @@
         settings = initSettings();
         rev = JSON.stringify(settings);
         injectCss();
-        registerEvents();
+        clearAllSpans();
         console.log(`${TAG} v${VERSION} 已加载`);
         initChatHooks();
         uiTimerId = setInterval(() => {
@@ -1302,7 +1346,7 @@
         module.exports = {
             VERSION, MODULE, TARGET_KEYS, TARGET_LABELS, PRESETS, SENTENCE_END,
             colorAt, glowShadow, graphemes, stopsOf, quoteSegments, approxOf, buildStreamCss,
-            gradientTextCss, streamGlowFilter,
+            gradientTextCss, glowFilter, targetDecl, buildColorCss, clearAllSpans,
             hexToRgb, rgbToHex, normHex, rgbToHsv, hsvToRgb, hexToHsv, hsvToHex,
             collectText, applyMes, restoreMes, finalizeGroups, applyGradientStyle, paintStreamChunk,
             _setSettingsForTest: (s) => { settings = s; rev = JSON.stringify(settings); },
