@@ -1,5 +1,5 @@
 /*!
- * 聊天文字调色 v1.1.8
+ * 聊天文字调色 v1.1.9
  * SillyTavern UI 扩展
  *
  * 功能：
@@ -22,7 +22,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.1.8';
+    const VERSION = '1.1.9';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -317,7 +317,7 @@
             stops: ['#ffb6c1', '#ffffff', '#a8d8ff'], // 渐变 2~4 色
             angle: 90,            // 渐变角度 0~360
             glow: false,          // 光晕开关
-            strength: 30,         // 光晕强度 0~100
+            strength: 15,         // 光晕强度 0~100
         };
     }
 
@@ -338,6 +338,7 @@
     let streamTimer = null;
     let paintTimer = null;
     let repaintTimer = null;
+    let colorCssTimer = null;    // 配色 CSS 重载防抖计时器（消息 DOM 重建后兜底）
     const mutTs = new Map();      // 每条消息最近一次 DOM 变动时间（流式稳定门控）
     const STREAM_SETTLE_MS = 600; // 距上次变动不足此时长时跳过逐字精确化，交给 CSS 近似兜底
     let booted = false;
@@ -349,7 +350,7 @@
     let openPickerBtn = null;
     const pendingMes = new Set();
     const observed = new WeakSet();
-    const chat = { el: null, mo: null, io: null, ro: null };
+    const chat = { el: null, mo: null, io: null, ro: null, cssMo: null };
 
     // ===== 酒馆上下文解析 =====
     async function resolveContext() {
@@ -490,6 +491,69 @@
         if (typeof document === 'undefined') return; // Node 纯函数测试环境
         const sc = document.getElementById('yyyx-color');
         if (sc) sc.textContent = buildColorCss(settings);
+    }
+
+    // 强制重载配色样式表：先移除再重建 style 节点，确保浏览器重新合成
+    // background-clip:text + filter drop-shadow（修复编辑保存后光晕丢失）。
+    function reloadColorCss() {
+        if (typeof document === 'undefined') return;
+        let sc = document.getElementById('yyyx-color');
+        if (sc) sc.remove();
+        sc = document.createElement('style');
+        sc.id = 'yyyx-color';
+        document.head.appendChild(sc);
+        sc.textContent = buildColorCss(settings);
+    }
+
+    // 消息 DOM 被酒馆重建后兜底：清理历史染色 span 并强制重载配色样式（防抖）
+    function scheduleColorReload(ms = 250) {
+        if (typeof document === 'undefined') return;
+        if (colorCssTimer) clearTimeout(colorCssTimer);
+        colorCssTimer = setTimeout(() => {
+            colorCssTimer = null;
+            clearAllSpans();
+            reloadColorCss();
+        }, ms);
+    }
+
+    // 轻量事件桥：消息编辑/新增/切换后酒馆会重建消息 DOM。
+    // 旧染色引擎观察器已停用，这里只做「清理残留 span + 重载 CSS」，保持元素级 drop-shadow 光晕。
+    function bindChatEvents() {
+        const es = ctx && ctx.eventSource;
+        const et = (ctx && ctx.event_types) || {};
+        if (!es || typeof es.on !== 'function') return;
+        const on = (name, fn) => { if (et[name]) es.on(et[name], fn); };
+        on('GENERATION_STARTED', () => { streaming = true; });
+        const endStream = () => { streaming = false; scheduleColorReload(120); };
+        on('GENERATION_ENDED', endStream);
+        on('GENERATION_STOPPED', endStream);
+        on('MESSAGE_EDITED', () => scheduleColorReload(200));
+        on('MESSAGE_SWIPED', () => scheduleColorReload(200));
+        on('MESSAGE_RECEIVED', () => scheduleColorReload(200));
+        on('MESSAGE_SENT', () => scheduleColorReload(200));
+        on('MESSAGE_DELETED', () => scheduleColorReload(200));
+        on('CHAT_CHANGED', () => scheduleColorReload(300));
+    }
+
+    // 兜底观察器：酒馆某些路径不派发事件，直接监听 #chat 子树变化。
+    // 仅在「消息元素」被新增/替换且非流式时重载 CSS，避免流式每 chunk 重建导致的闪烁。
+    function watchChatMutations() {
+        const c = chat.el;
+        if (!c || chat.cssMo) return;
+        if (typeof MutationObserver === 'undefined') return;
+        chat.cssMo = new MutationObserver(muts => {
+            if (applying || streaming) return;
+            for (const mu of muts) {
+                if (mu.type !== 'childList') continue;
+                for (const n of mu.addedNodes) {
+                    if (n.nodeType !== 1) continue;
+                    const mes = n.classList && n.classList.contains('mes') ? n
+                        : (n.querySelector ? n.querySelector('.mes') : null);
+                    if (mes) { scheduleColorReload(250); return; }
+                }
+            }
+        });
+        chat.cssMo.observe(c, { childList: true, subtree: true });
     }
 
     // ===== 染色引擎 =====
@@ -1199,7 +1263,7 @@
             : ['#ffffff', '#ffffff'];
         const angle = Number.isFinite(entry.angle) ? entry.angle : 90;
         const glow = !!entry.glow;
-        const strength = Number.isFinite(entry.strength) ? entry.strength : 30;
+        const strength = Number.isFinite(entry.strength) ? entry.strength : 15;
         for (const k of ['italic', 'quote']) {
             settings[k].mode = 'gradient';
             settings[k].stops = stops.slice();
@@ -1284,12 +1348,12 @@
         for (const p of PRESETS) {
             const grad = `linear-gradient(90deg, ${p.stops.join(', ')})`;
             const $btn = $(`<button type="button" class="yyx-chip" title="应用「${p.name}」配色"><span class="yyx-sw" style="background:${grad}"></span><span>${p.name}</span></button>`);
-            $btn.on('click', () => applyGradientStyle({ stops: p.stops, angle: 90, glow: true, strength: 50 }));
+            $btn.on('click', () => applyGradientStyle({ stops: p.stops, angle: 90, glow: true, strength: 15 }));
             $pres.append($btn);
         }
 
         $panel.find('.yyx-reset').on('click', resetAll);
-        $panel.find('.yyx-repaint').on('click', () => repaintAll());
+        $panel.find('.yyx-repaint').on('click', () => { clearAllSpans(); reloadColorCss(); });
         refreshAllUI();
     }
 
@@ -1311,6 +1375,7 @@
                 clearInterval(t);
                 chat.el = c;
                 clearAllSpans();
+                watchChatMutations();
                 return;
             }
             if (++tries > 200) clearInterval(t);
@@ -1329,6 +1394,7 @@
         rev = JSON.stringify(settings);
         injectCss();
         clearAllSpans();
+        bindChatEvents();
         console.log(`${TAG} v${VERSION} 已加载`);
         initChatHooks();
         uiTimerId = setInterval(() => {
@@ -1358,6 +1424,7 @@
                 if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; }
                 if (paintTimer) { clearTimeout(paintTimer); paintTimer = null; }
                 if (repaintTimer) { clearTimeout(repaintTimer); repaintTimer = null; }
+                if (colorCssTimer) { clearTimeout(colorCssTimer); colorCssTimer = null; }
             },
         };
     }
