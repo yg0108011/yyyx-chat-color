@@ -1,5 +1,5 @@
 /*!
- * 聊天文字调色 v1.1.10
+ * 聊天文字调色 v1.1.11
  * SillyTavern UI 扩展
  *
  * 功能：
@@ -22,7 +22,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.1.10';
+    const VERSION = '1.1.11';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -241,6 +241,15 @@
         for (const k of ['main', 'quote', 'italic']) {
             const d = targetDecl(s && s[k]);
             if (d) css += `${sel[k]}{${d}}`;
+        }
+        // 行内元素（q / em）为 drop-shadow 光晕留出渲染空间：左右各 3px 内边距，
+        // 复刻「雨夜回响」.mes_text q 的 padding:0 3px，避免行末/行首字符被 filter 渲染层裁切。
+        const qc = s && s.quote, ic = s && s.italic;
+        if (qc && qc.mode === 'gradient' && qc.glow) {
+            css += `#chat .mes .mes_text q{padding:0 3px!important}`;
+        }
+        if (ic && ic.mode === 'gradient' && ic.glow) {
+            css += `#chat .mes .mes_text em{padding:0 3px!important}`;
         }
         return css;
     }
