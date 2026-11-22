@@ -1,5 +1,5 @@
 /*!
- * 聊天文字调色 v1.1.18
+ * 聊天文字调色 v1.1.19
  * SillyTavern UI 扩展
  *
  * 功能：
@@ -9,7 +9,7 @@
  *    - 纯色（可自定义颜色）
  *    - 渐变（自定义 2~4 个颜色，可调整渐变角度 0~360°）
  *      渐变带霓虹光晕开关与强度调节（逐字同色 text-shadow，蓝段蓝光、黄段黄光）
- * 3. 渐变粒度：主要文本 = 整条消息；斜体 = 每个 em 段落；引用 = 每个引号内对话独立循环（引号外叙述保持酒馆原色）。
+ * 3. 渐变粒度：主要文本 = 整条消息；斜体 = 每对 *xxx*（em）独立循环；引用 = 每个引号内对话独立循环（引号外叙述保持酒馆原色）。
  * 4. 内置 10 套配色预设 + 3 套可保存的自定义预设。
  * 5. 设置面板跟随酒馆主题与字体大小，顶部横排文字类型标签切换。
  *
@@ -23,7 +23,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.1.18';
+    const VERSION = '1.1.19';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -221,14 +221,16 @@
     // 生成流式兜底 CSS：流式期间让「尚未逐字染色的消息」立即呈现完整渐变 + 光晕。
     // 双轨命中：
     //  A. data-yyx-stream 逐消息标记（兼容旧路径）；
-    //  B. #chat.yyx-streaming + :not([data-yyx="1"])——流式开始时给 #chat 加类，
-    //     任何刚插入、还没拿到标记的消息会立刻命中，消除「酒馆主题色 → 渐变」的闪烁窗口。
+    //  B. #chat.yyx-streaming——流式开始时给 #chat 加类，整页消息立刻命中元素级兜底。
+    //     不再用 :not([data-yyx="1"]) 排除：消息刚被酒馆重建的瞬间旧完成标记尚未被观察器清除，
+    //     若排除已处理消息会留下「主题色 → 渐变」的空窗造成闪烁；流式期间本就不跑逐字校正，
+    //     已染色消息的逐字 span 内联 important 样式优先于本样式表，不会被兜底覆盖。
     // DOM 稳定后再精确逐字校正。
     function buildStreamCss(s) {
         const rows = [
-            ['main', '#chat .mes[data-yyx-stream] .mes_text', '#chat.yyx-streaming .mes:not([data-yyx="1"]) .mes_text'],
-            ['italic', '#chat .mes[data-yyx-stream] .mes_text em', '#chat.yyx-streaming .mes:not([data-yyx="1"]) .mes_text em'],
-            ['quote', '#chat .mes[data-yyx-stream] .mes_text q, #chat .mes[data-yyx-stream] .mes_text blockquote', '#chat.yyx-streaming .mes:not([data-yyx="1"]) .mes_text q, #chat.yyx-streaming .mes:not([data-yyx="1"]) .mes_text blockquote'],
+            ['main', '#chat .mes[data-yyx-stream] .mes_text', '#chat.yyx-streaming .mes .mes_text'],
+            ['italic', '#chat .mes[data-yyx-stream] .mes_text em', '#chat.yyx-streaming .mes .mes_text em'],
+            ['quote', '#chat .mes[data-yyx-stream] .mes_text q, #chat .mes[data-yyx-stream] .mes_text blockquote', '#chat.yyx-streaming .mes .mes_text q, #chat.yyx-streaming .mes .mes_text blockquote'],
         ];
         let css = '';
         for (const [k, selA, selB] of rows) {
@@ -653,7 +655,8 @@
         if (!key) { key = new Map(); groups.set(container, key); }
         let gid = 0;
         const byQuote = granularity === 'quote';     // 引用：每对引号一个循环，叙述不染
-        const byOrder = byQuote;                       // 引号内按字符顺序线性取色
+        const byEm = granularity === 'em';           // 斜体：每对 * 包裹的 em 一个循环
+        const byOrder = byQuote || byEm;             // 引号内 / 斜体按字符顺序线性取色
         let qstate = null;                             // 引用引号状态跨文本节点延续
         const getList = (g) => {
             let L = key.get(g);
@@ -809,7 +812,7 @@
         // 斜体优先（最内层），引用其次，主要文本最后
         for (const em of mt.querySelectorAll('em')) {
             if (em.closest('code, pre, [data-yyx]')) continue;
-            paintTargetEl(em, s.italic, groups, 'block');
+            paintTargetEl(em, s.italic, groups, 'em');
         }
         for (const q of mt.querySelectorAll('q, blockquote')) {
             if (q.closest('code, pre')) continue;
@@ -817,6 +820,8 @@
         }
         paintTargetEl(mt, s.main, groups, 'message', 'em, q, blockquote');
         finalizeGroups(groups);
+        // 已成功逐字染色：移除残留的流式兜底标记，避免元素级兜底 CSS 继续覆盖逐字样式（编辑后变淡）
+        mes.removeAttribute('data-yyx-stream');
         markDone(mes);
     }
 
