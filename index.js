@@ -1,5 +1,5 @@
 /*!
- * 聊天文字调色 v1.1.5
+ * 聊天文字调色 v1.1.6
  * SillyTavern UI 扩展
  *
  * 功能：
@@ -26,7 +26,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.1.5';
+    const VERSION = '1.1.6';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -385,13 +385,15 @@
 .yyx-sv { border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,.2)); border-radius: 6px; cursor: crosshair; touch-action: none; }
 .yyx-hue { position: relative; width: 18px; height: 120px; border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,.2)); cursor: ns-resize; touch-action: none; background: linear-gradient(to bottom, #ff0000 0%, #ffff00 16.7%, #00ff00 33.3%, #00ffff 50%, #0000ff 66.7%, #ff00ff 83.3%, #ff0000 100%); }
 .yyx-hue-knob { position: absolute; left: -3px; width: 22px; height: 6px; margin-top: -3px; border-radius: 3px; background: #fff; border: 1px solid rgba(0,0,0,.55); pointer-events: none; box-sizing: border-box; }
-.yyx-picker-side { display: flex; flex-direction: column; justify-content: center; align-items: stretch; flex: 1 1 auto; min-width: 0; gap: 8px; }
+.yyx-picker-side { display: flex; flex-direction: column; justify-content: flex-start; align-items: stretch; flex: 1 1 auto; min-width: 0; gap: 8px; }
 .yyx-side-row { display: flex; align-items: center; gap: 6px; }
 .yyx-side-lbl { opacity: .7; flex: none; width: 2.6em; }
 .yyx-prev { width: 1.7em; height: 1.7em; border-radius: 6px; flex: none; }
 .yyx-prevhex { font-variant-numeric: tabular-nums; opacity: .95; }
 .yyx-side-row .yyx-in { flex: 1 1 0; min-width: 0; }
-.yyx-picker-actions { display: flex; justify-content: flex-end; margin-top: 6px; }
+.yyx-side-row .yyx-fnum { flex: 1 1 0; min-width: 3.2em; -moz-appearance: textfield; appearance: textfield; }
+.yyx-side-row .yyx-fnum::-webkit-outer-spin-button, .yyx-side-row .yyx-fnum::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.yyx-picker-actions { display: flex; justify-content: flex-end; margin-top: 2px; }
 .yyx-pickbtn.yyx-active { outline: 1px solid var(--SmartThemeQuoteColor, rgba(255,255,255,.5)); }
 `;
         document.head.appendChild(st);
@@ -844,9 +846,9 @@
               <div class="yyx-side-row"><span class="yyx-sw yyx-prev"></span><span class="yyx-prevhex"></span></div>
               <div class="yyx-side-row"><span class="yyx-side-lbl">Hex</span><input type="text" class="yyx-in yyx-fhex" maxlength="7" spellcheck="false"></div>
               <div class="yyx-side-row"><span class="yyx-side-lbl">RGB</span><input type="number" class="yyx-in yyx-fnum" min="0" max="255" step="1"><input type="number" class="yyx-in yyx-fnum" min="0" max="255" step="1"><input type="number" class="yyx-in yyx-fnum" min="0" max="255" step="1"></div>
+              <div class="yyx-picker-actions"><button type="button" class="menu_button yyx-picker-ok">确定</button></div>
             </div>
           </div>
-          <div class="yyx-picker-actions"><button type="button" class="menu_button yyx-picker-ok">确定</button></div>
         </div>`);
         const canvas = $box.find('.yyx-sv')[0];
         const ctx2d = canvas.getContext('2d');
