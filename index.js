@@ -26,7 +26,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.1.6';
+    const VERSION = '1.1.7';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -164,9 +164,34 @@
         return { color, glow: strength > 0 ? glowShadow(color, strength) : null };
     }
 
+    // 流式兜底：元素级渐变文字（background-clip:text），让斜体/引用在流式期间就呈现渐变
+    function gradientTextCss(stops, angle) {
+        const list = stopsOf({ stops });
+        const a = Number.isFinite(Number(angle)) ? Number(angle) : 90;
+        return `background: linear-gradient(${a}deg, ${list.join(', ')}) !important; -webkit-background-clip: text !important; background-clip: text !important; color: transparent !important; -webkit-text-fill-color: transparent !important;`;
+    }
+
+    // 流式兜底光晕：参考「雨夜回响」主题，用多层 drop-shadow 跟随渐变文字轮廓发光。
+    // 三层分别取渐变起点/中点/终点色（蓝段蓝光、白段白光、黄段黄光），强度同时缩放半径与透明度。
+    function streamGlowFilter(stops, strength) {
+        const s = Math.min(1, Math.max(0, (Number(strength) || 0) / 100));
+        if (!(s > 0)) return 'none';
+        const list = stopsOf({ stops });
+        const scale = 0.5 + 0.5 * s;
+        const layers = [
+            { r: 2,  a: 0.50, t: 0 },
+            { r: 8,  a: 0.32, t: 0.5 },
+            { r: 24, a: 0.20, t: 1 },
+        ];
+        return layers.map(L => {
+            const [r, g, b] = hexToRgb(colorAt(list, L.t));
+            return `drop-shadow(0 0 ${(L.r * scale).toFixed(2)}px rgba(${r},${g},${b},${(L.a * scale).toFixed(3)}))`;
+        }).join(' ');
+    }
+
     // 生成流式兜底 CSS：只命中带 data-yyx-stream 的消息中尚未逐字染色的文本；
     // 已染色 span 的 inline !important 优先于本规则，不受影响。
-    // text-shadow 不继承：主要文本的光晕经通配命中所有未染色子元素，斜体/引用由高优先级选择器覆盖
+    // 斜体/引用在流式期间即呈现渐变与光晕（雨夜回响式 drop-shadow）；主要文本仍用中点色近似兜底。
     function buildStreamCss(s) {
         const selColor = {
             main: '#chat .mes[data-yyx-stream] .mes_text',
@@ -174,16 +199,25 @@
             quote: '#chat .mes[data-yyx-stream] .mes_text q, #chat .mes[data-yyx-stream] .mes_text blockquote',
         };
         let css = '';
-        for (const k of TARGET_KEYS) {
-            const a = approxOf(s && s[k]);
-            if (!a) continue;
-            css += `${selColor[k]} { color: ${a.color} !important;`;
-            if (k !== 'main') css += ` text-shadow: ${a.glow || 'none'} !important;`;
-            css += ' } ';
+        for (const k of ['italic', 'quote']) {
+            const cfg = s && s[k];
+            if (!cfg || cfg.mode === 'theme') continue;
+            const sel = selColor[k];
+            if (cfg.mode === 'solid') {
+                css += `${sel} { color: ${cfg.color || '#ffffff'} !important; text-shadow: none !important; } `;
+            } else {
+                const stops = stopsOf(cfg);
+                const angle = Number.isFinite(Number(cfg.angle)) ? Number(cfg.angle) : 90;
+                const glow = cfg.glow ? streamGlowFilter(stops, cfg.strength) : 'none';
+                css += `${sel} { ${gradientTextCss(stops, angle)} text-shadow: none !important; filter: ${glow} !important; } `;
+            }
         }
         const aMain = approxOf(s && s.main);
-        if (aMain && aMain.glow) {
-            css += `#chat .mes[data-yyx-stream] .mes_text * { text-shadow: ${aMain.glow} !important; }`;
+        if (aMain) {
+            css += `${selColor.main} { color: ${aMain.color} !important; } `;
+            if (aMain.glow) {
+                css += `#chat .mes[data-yyx-stream] .mes_text * { text-shadow: ${aMain.glow} !important; }`;
+            }
         }
         return css;
     }
@@ -1268,6 +1302,7 @@
         module.exports = {
             VERSION, MODULE, TARGET_KEYS, TARGET_LABELS, PRESETS, SENTENCE_END,
             colorAt, glowShadow, graphemes, stopsOf, quoteSegments, approxOf, buildStreamCss,
+            gradientTextCss, streamGlowFilter,
             hexToRgb, rgbToHex, normHex, rgbToHsv, hsvToRgb, hexToHsv, hsvToHex,
             collectText, applyMes, restoreMes, finalizeGroups, applyGradientStyle, paintStreamChunk,
             _setSettingsForTest: (s) => { settings = s; rev = JSON.stringify(settings); },
