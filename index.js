@@ -1,5 +1,5 @@
 /*!
- * 聊天文字调色 v1.1.9
+ * 聊天文字调色 v1.1.10
  * SillyTavern UI 扩展
  *
  * 功能：
@@ -22,7 +22,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.1.9';
+    const VERSION = '1.1.10';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -167,22 +167,18 @@
         return `background: linear-gradient(${a}deg, ${list.join(', ')}) !important; -webkit-background-clip: text !important; background-clip: text !important; color: transparent !important; -webkit-text-fill-color: transparent !important;`;
     }
 
-    // 流式兜底光晕：参考「雨夜回响」主题，用多层 drop-shadow 跟随渐变文字轮廓发光。
-    // 三层分别取渐变起点/中点/终点色（蓝段蓝光、白段白光、黄段黄光），强度同时缩放半径与透明度。
+    // 光晕：复刻「雨夜回响」主题的发光——两层 drop-shadow，内层取渐变尾色、外层取渐变首色。
+    // 半径/透明度随强度线性缩放，100% 即雨夜回响原始参数（内层 3px/0.35、外层 6px/0.20）。
     function glowFilter(stops, strength) {
         const s = Math.min(1, Math.max(0, (Number(strength) || 0) / 100));
         if (!(s > 0)) return 'none';
         const list = stopsOf({ stops });
-        const scale = 0.5 + 0.5 * s;
-        const layers = [
-            { r: 2,  a: 0.50, t: 0 },
-            { r: 8,  a: 0.32, t: 0.5 },
-            { r: 24, a: 0.20, t: 1 },
-        ];
-        return layers.map(L => {
-            const [r, g, b] = hexToRgb(colorAt(list, L.t));
-            return `drop-shadow(0 0 ${(L.r * scale).toFixed(2)}px rgba(${r},${g},${b},${(L.a * scale).toFixed(3)}))`;
-        }).join(' ');
+        const first = hexToRgb(list[0]);
+        const last = hexToRgb(list[list.length - 1]);
+        return [
+            `drop-shadow(0 0 ${(3 * s).toFixed(2)}px rgba(${last[0]},${last[1]},${last[2]},${(0.35 * s).toFixed(3)}))`,
+            `drop-shadow(0 0 ${(6 * s).toFixed(2)}px rgba(${first[0]},${first[1]},${first[2]},${(0.20 * s).toFixed(3)}))`,
+        ].join(' ');
     }
 
     // 生成流式兜底 CSS：只命中带 data-yyx-stream 的消息中尚未逐字染色的文本；
@@ -317,7 +313,7 @@
             stops: ['#ffb6c1', '#ffffff', '#a8d8ff'], // 渐变 2~4 色
             angle: 90,            // 渐变角度 0~360
             glow: false,          // 光晕开关
-            strength: 15,         // 光晕强度 0~100
+            strength: 100,        // 光晕强度 0~100（100 = 雨夜回响原始光晕）
         };
     }
 
@@ -1263,7 +1259,7 @@
             : ['#ffffff', '#ffffff'];
         const angle = Number.isFinite(entry.angle) ? entry.angle : 90;
         const glow = !!entry.glow;
-        const strength = Number.isFinite(entry.strength) ? entry.strength : 15;
+        const strength = Number.isFinite(entry.strength) ? entry.strength : 100;
         for (const k of ['italic', 'quote']) {
             settings[k].mode = 'gradient';
             settings[k].stops = stops.slice();
@@ -1348,7 +1344,7 @@
         for (const p of PRESETS) {
             const grad = `linear-gradient(90deg, ${p.stops.join(', ')})`;
             const $btn = $(`<button type="button" class="yyx-chip" title="应用「${p.name}」配色"><span class="yyx-sw" style="background:${grad}"></span><span>${p.name}</span></button>`);
-            $btn.on('click', () => applyGradientStyle({ stops: p.stops, angle: 90, glow: true, strength: 15 }));
+            $btn.on('click', () => applyGradientStyle({ stops: p.stops, angle: 90, glow: true, strength: 100 }));
             $pres.append($btn);
         }
 
