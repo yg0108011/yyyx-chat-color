@@ -1,5 +1,5 @@
 /*!
- * 聊天文字调色 v1.1.13
+ * 聊天文字调色 v1.1.14
  * SillyTavern UI 扩展
  *
  * 功能：
@@ -8,21 +8,21 @@
  *    - 跟随酒馆主题（不做任何处理）
  *    - 纯色（可自定义颜色）
  *    - 渐变（自定义 2~4 个颜色，可调整渐变角度 0~360°）
- *      渐变带霓虹光晕开关与强度调节（元素级多层 drop-shadow，参考「雨夜回响」）
+ *      渐变带霓虹光晕开关与强度调节（逐字同色 text-shadow，蓝段蓝光、黄段黄光）
  * 3. 渐变粒度：主要文本 = 整条消息；斜体 = 每个 em 段落；引用 = 每个 q / blockquote 整段。
  * 4. 内置 10 套配色预设 + 3 套可保存的自定义预设。
  * 5. 设置面板跟随酒馆主题与字体大小，顶部横排文字类型标签切换。
  *
  * 性能设计：
- * - 纯 CSS 元素级渲染（background-clip:text 渐变 + filter drop-shadow），
- *   不逐字插入 span、不做逐字阴影，流式与最终渲染共用，无闪烁、无变色延迟。
+ * - 逐字染色按需触发（设置变化 / 生成结束 / 进入视口），每字同色 text-shadow 不创建合成层；
+ *   流式期间以中点色近似兜底 + 稳定窗口门控，生成结束后自动逐字精确校正。
  */
 (() => {
     'use strict';
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.1.13';
+    const VERSION = '1.1.14';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -52,8 +52,8 @@
         { id: 'gold',         name: '金',   stops: ['#d4af37', '#fdf6e2', '#e5cf76'] },
     ];
 
-    // 光晕：三层 drop-shadow（内亮/中/外晕），逐字跟随字色。
-    // v1.1.2 起：以最高优先级（!important）写入避免被主题覆盖；半径与透明度放大到霓虹级。
+    // 光晕：每字同色三层 text-shadow（贴字亮边/中层/外晕），颜色 = 该字在渐变中的颜色。
+    // v1.1.14 起：运行时主路径回到逐字引擎——每个字单独发光、光晕色跟随该字，不再用元素级一刀切 drop-shadow。
     const GLOW_LAYERS = [
         { radius: 2,  alpha: 1.00 },
         { radius: 8,  alpha: 0.85 },
@@ -139,8 +139,8 @@
         let v = shadowCache.get(key);
         if (!v) {
             v = GLOW_LAYERS.map(L => {
-                const rr = (L.radius * (0.5 + 0.5 * s)).toFixed(2);
-                const aa = (L.alpha * (0.5 + 0.5 * s)).toFixed(3);
+                const rr = (L.radius * s).toFixed(2);
+                const aa = (L.alpha * s).toFixed(3);
                 return `0 0 ${rr}px rgba(${r},${g},${b},${aa})`;
             }).join(', ');
             shadowCache.set(key, v);
@@ -183,8 +183,8 @@
     }
 
     // 生成流式兜底 CSS：只命中带 data-yyx-stream 的消息中尚未逐字染色的文本；
-    // 已染色 span 的 inline !important 优先于本规则，不受影响。
-    // 斜体/引用在流式期间即呈现渐变与光晕（雨夜回响式 drop-shadow）；主要文本仍用中点色近似兜底。
+    // 每类文字用渐变中点色 + 同色三层 text-shadow 近似发光（与最终逐字光晕同构），
+    // 待 DOM 稳定后再由 paintStreamChunk / repaintAll 补上精确的逐字颜色与光晕。
     function buildStreamCss(s) {
         const selColor = {
             main: '#chat .mes[data-yyx-stream] .mes_text',
@@ -192,25 +192,12 @@
             quote: '#chat .mes[data-yyx-stream] .mes_text q, #chat .mes[data-yyx-stream] .mes_text blockquote',
         };
         let css = '';
-        for (const k of ['italic', 'quote']) {
-            const cfg = s && s[k];
-            if (!cfg || cfg.mode === 'theme') continue;
-            const sel = selColor[k];
-            if (cfg.mode === 'solid') {
-                css += `${sel} { color: ${cfg.color || '#ffffff'} !important; text-shadow: none !important; } `;
-            } else {
-                const stops = stopsOf(cfg);
-                const angle = Number.isFinite(Number(cfg.angle)) ? Number(cfg.angle) : 90;
-                const glow = cfg.glow ? glowFilter(stops, cfg.strength) : 'none';
-                css += `${sel} { ${gradientTextCss(stops, angle)} text-shadow: none !important; filter: ${glow} !important; } `;
-            }
-        }
-        const aMain = approxOf(s && s.main);
-        if (aMain) {
-            css += `${selColor.main} { color: ${aMain.color} !important; } `;
-            if (aMain.glow) {
-                css += `#chat .mes[data-yyx-stream] .mes_text * { text-shadow: ${aMain.glow} !important; }`;
-            }
+        for (const k of ['main', 'italic', 'quote']) {
+            const a = approxOf(s && s[k]);
+            if (!a) continue;
+            css += `${selColor[k]} { color: ${a.color} !important;`;
+            if (a.glow) css += ` text-shadow: ${a.glow} !important;`;
+            css += ` } `;
         }
         return css;
     }
@@ -323,7 +310,7 @@
             stops: ['#ffb6c1', '#ffffff', '#a8d8ff'], // 渐变 2~4 色
             angle: 90,            // 渐变角度 0~360
             glow: false,          // 光晕开关
-            strength: 100,        // 光晕强度 0~100（100 = 雨夜回响原始光晕）
+            strength: 100,        // 光晕强度 0~100（100 = 原始霓虹参数）
         };
     }
 
@@ -482,14 +469,15 @@
 .yyx-pickbtn.yyx-active { outline: 1px solid var(--SmartThemeQuoteColor, rgba(255,255,255,.5)); }
 `;
         document.head.appendChild(st);
-        // 动态配色样式表：三类文字的元素级渐变/纯色 + drop-shadow 光晕（雨夜回响式），流式与最终渲染共用
-        let sc = document.getElementById('yyyx-color');
+        // 流式兜底样式表：流式期间给尚未逐字染色的文字提供中点色 + 同色光晕近似，
+        // 待 DOM 稳定后由逐字引擎（paintStreamChunk / repaintAll）补上精确颜色。
+        let sc = document.getElementById('yyyx-stream');
         if (!sc) {
             sc = document.createElement('style');
-            sc.id = 'yyyx-color';
+            sc.id = 'yyyx-stream';
             document.head.appendChild(sc);
         }
-        sc.textContent = buildColorCss(settings);
+        sc.textContent = buildStreamCss(settings);
     }
 
     // 设置变化时刷新动态配色样式
@@ -497,6 +485,13 @@
         if (typeof document === 'undefined') return; // Node 纯函数测试环境
         const sc = document.getElementById('yyyx-color');
         if (sc) sc.textContent = buildColorCss(settings);
+    }
+
+    // 设置变化时刷新流式兜底样式（逐字引擎运行时路径）
+    function updateStreamCss() {
+        if (typeof document === 'undefined') return;
+        const sc = document.getElementById('yyyx-stream');
+        if (sc) sc.textContent = buildStreamCss(settings);
     }
 
     // 强制重载配色样式表：先移除再重建 style 节点，确保浏览器重新合成
@@ -1298,8 +1293,9 @@
     function onChange() {
         saveNow();
         rev = JSON.stringify(settings);
-        updateColorCss();
+        updateStreamCss();
         clearAllSpans();
+        scheduleRepaint(150);
     }
 
     function refreshAllUI() {
@@ -1359,7 +1355,7 @@
         }
 
         $panel.find('.yyx-reset').on('click', resetAll);
-        $panel.find('.yyx-repaint').on('click', () => { clearAllSpans(); reloadColorCss(); });
+        $panel.find('.yyx-repaint').on('click', () => { clearAllSpans(); scheduleRepaint(50); });
         refreshAllUI();
     }
 
@@ -1373,7 +1369,7 @@
 
     // ===== 启动 =====
     function initChatHooks() {
-        // 纯 CSS 方案无需观察器：等待 chat 出现后清理一次历史 span 即可
+        // 逐字引擎：等待 chat 出现后启用观察器（增量染色 + 流式稳定门控），并做首次全量染色。
         let tries = 0;
         const t = setInterval(() => {
             const c = document.getElementById('chat');
@@ -1381,7 +1377,8 @@
                 clearInterval(t);
                 chat.el = c;
                 clearAllSpans();
-                watchChatMutations();
+                ensureObservers();
+                scheduleRepaint(50);
                 return;
             }
             if (++tries > 200) clearInterval(t);
@@ -1400,7 +1397,7 @@
         rev = JSON.stringify(settings);
         injectCss();
         clearAllSpans();
-        bindChatEvents();
+        registerEvents();
         console.log(`${TAG} v${VERSION} 已加载`);
         initChatHooks();
         uiTimerId = setInterval(() => {
