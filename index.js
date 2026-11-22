@@ -1,5 +1,5 @@
 /*!
- * 聊天文字调色 v1.1.12
+ * 聊天文字调色 v1.1.13
  * SillyTavern UI 扩展
  *
  * 功能：
@@ -22,7 +22,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.1.12';
+    const VERSION = '1.1.13';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -167,10 +167,9 @@
         return `background: linear-gradient(${a}deg, ${list.join(', ')}) !important; -webkit-background-clip: text !important; background-clip: text !important; color: transparent !important; -webkit-text-fill-color: transparent !important;`;
     }
 
-    // 光晕：复刻「雨夜回响」主题名字/标题的霓虹发光——两层 drop-shadow，
-    // 内层取渐变首色（贴字亮边）、外层取渐变尾色（大半径扩散晕）。
-    // 半径/透明度随强度线性缩放，100% 即雨夜回响名字光晕原始参数
-    // （内层首色 3px/0.45、外层尾色 8px/0.25）。
+    // 光晕：两层 drop-shadow 霓虹发光——内层取渐变首色（贴字亮边）、外层取渐变尾色（大范围扩散晕）。
+    // 半径/透明度随强度线性缩放，100% 时为强霓虹档（内层首色 3px/0.60、外层尾色 10px/0.45），
+    // 明显强于「雨夜回响」名字光晕（3px/0.45、8px/0.25），保证暗色尾色下光晕也清晰可见。
     function glowFilter(stops, strength) {
         const s = Math.min(1, Math.max(0, (Number(strength) || 0) / 100));
         if (!(s > 0)) return 'none';
@@ -178,8 +177,8 @@
         const first = hexToRgb(list[0]);
         const last = hexToRgb(list[list.length - 1]);
         return [
-            `drop-shadow(0 0 ${(3 * s).toFixed(2)}px rgba(${first[0]},${first[1]},${first[2]},${(0.45 * s).toFixed(3)}))`,
-            `drop-shadow(0 0 ${(8 * s).toFixed(2)}px rgba(${last[0]},${last[1]},${last[2]},${(0.25 * s).toFixed(3)}))`,
+            `drop-shadow(0 0 ${(3 * s).toFixed(2)}px rgba(${first[0]},${first[1]},${first[2]},${(0.60 * s).toFixed(3)}))`,
+            `drop-shadow(0 0 ${(10 * s).toFixed(2)}px rgba(${last[0]},${last[1]},${last[2]},${(0.45 * s).toFixed(3)}))`,
         ].join(' ');
     }
 
