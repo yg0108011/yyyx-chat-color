@@ -1,5 +1,5 @@
 /*!
- * 聊天文字调色 v1.1.14
+ * 聊天文字调色 v1.1.15
  * SillyTavern UI 扩展
  *
  * 功能：
@@ -15,14 +15,15 @@
  *
  * 性能设计：
  * - 逐字染色按需触发（设置变化 / 生成结束 / 进入视口），每字同色 text-shadow 不创建合成层；
- *   流式期间以中点色近似兜底 + 稳定窗口门控，生成结束后自动逐字精确校正。
+ *   流式期间以元素级渐变（background-clip:text）近似兜底 + 稳定窗口门控，
+ *   生成结束后自动逐字精确校正为每字同色光晕。
  */
 (() => {
     'use strict';
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.1.14';
+    const VERSION = '1.1.15';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -182,22 +183,37 @@
         ].join(' ');
     }
 
-    // 生成流式兜底 CSS：只命中带 data-yyx-stream 的消息中尚未逐字染色的文本；
-    // 每类文字用渐变中点色 + 同色三层 text-shadow 近似发光（与最终逐字光晕同构），
-    // 待 DOM 稳定后再由 paintStreamChunk / repaintAll 补上精确的逐字颜色与光晕。
+    // 流式兜底声明：流式期间用「元素级渐变 + 中点色三层 text-shadow」近似呈现，
+    // 让渐变文字在生成过程中就可见完整渐变与光晕（不再退化为中点单色）；
+    // 生成结束后由逐字引擎 paintStreamChunk / repaintAll 精确校正为每字同色光晕。
+    function streamDecl(cfg) {
+        if (!cfg || cfg.mode === 'theme') return '';
+        const strength = cfg.glow ? Math.min(1, Math.max(0, (Number(cfg.strength) || 0) / 100)) : 0;
+        if (cfg.mode === 'solid') {
+            let d = `color:${cfg.color}!important;-webkit-text-fill-color:${cfg.color}!important;background:none!important;`;
+            d += strength > 0 ? `text-shadow:${glowShadow(cfg.color, strength)}!important;` : `text-shadow:none!important;`;
+            return d;
+        }
+        const stops = stopsOf(cfg);
+        const angle = Number.isFinite(Number(cfg.angle)) ? Number(cfg.angle) : 90;
+        const glowHex = colorAt(stops, 0.5);
+        let d = `background:linear-gradient(${angle}deg,${stops.join(',')})!important;-webkit-background-clip:text!important;background-clip:text!important;color:transparent!important;-webkit-text-fill-color:transparent!important;`;
+        d += strength > 0 ? `text-shadow:${glowShadow(glowHex, strength)}!important;` : `text-shadow:none!important;`;
+        return d;
+    }
+
+    // 生成流式兜底 CSS：只命中带 data-yyx-stream 的消息（尚未逐字精确染色的消息），
+    // 让每类文字在流式期间就呈现完整渐变 + 光晕；DOM 稳定后再精确逐字校正。
     function buildStreamCss(s) {
-        const selColor = {
+        const sel = {
             main: '#chat .mes[data-yyx-stream] .mes_text',
             italic: '#chat .mes[data-yyx-stream] .mes_text em',
             quote: '#chat .mes[data-yyx-stream] .mes_text q, #chat .mes[data-yyx-stream] .mes_text blockquote',
         };
         let css = '';
         for (const k of ['main', 'italic', 'quote']) {
-            const a = approxOf(s && s[k]);
-            if (!a) continue;
-            css += `${selColor[k]} { color: ${a.color} !important;`;
-            if (a.glow) css += ` text-shadow: ${a.glow} !important;`;
-            css += ` } `;
+            const d = streamDecl(s && s[k]);
+            if (d) css += `${sel[k]}{${d}}`;
         }
         return css;
     }
@@ -824,8 +840,11 @@
                 restoreMes(m);
                 applyMes(m);
             }
-            // 精确染色完成后移除流式近似兜底标记（CSS 近似色随之失效，无原生色窗口）
-            for (const el of c.querySelectorAll('[data-yyx-stream]')) el.removeAttribute('data-yyx-stream');
+            // 仅对「已成功逐字染色」的消息移除流式近似兜底标记，让 CSS 近似色随之失效；
+            // 尚未染色（如布局未就绪被跳过）的消息保留标记，兜底渐变持续生效，避免落回酒馆主题色。
+            for (const m of c.querySelectorAll('.mes[data-yyx-stream]')) {
+                if (m.dataset.yyx === '1') m.removeAttribute('data-yyx-stream');
+            }
             mutTs.clear();
         } finally {
             applying = false;
@@ -1414,7 +1433,7 @@
     if (typeof module !== 'undefined' && module.exports) {
         module.exports = {
             VERSION, MODULE, TARGET_KEYS, TARGET_LABELS, PRESETS, SENTENCE_END,
-            colorAt, glowShadow, graphemes, stopsOf, quoteSegments, approxOf, buildStreamCss,
+            colorAt, glowShadow, graphemes, stopsOf, quoteSegments, approxOf, streamDecl, buildStreamCss,
             gradientTextCss, glowFilter, targetDecl, buildColorCss, clearAllSpans,
             hexToRgb, rgbToHex, normHex, rgbToHsv, hsvToRgb, hexToHsv, hsvToHex,
             collectText, applyMes, restoreMes, finalizeGroups, applyGradientStyle, paintStreamChunk,
