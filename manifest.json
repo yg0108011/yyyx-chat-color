@@ -1,0 +1,9 @@
+{
+    "display_name": "聊天文字调色",
+    "loading_order": 10,
+    "js": "index.js",
+    "author": "Doubao",
+    "version": "1.1.5",
+    "homePage": "",
+    "auto_update": false
+}
