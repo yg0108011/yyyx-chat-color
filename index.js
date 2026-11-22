@@ -1,5 +1,5 @@
 /*!
- * 聊天文字调色 v1.1.15
+ * 聊天文字调色 v1.1.16
  * SillyTavern UI 扩展
  *
  * 功能：
@@ -9,35 +9,29 @@
  *    - 纯色（可自定义颜色）
  *    - 渐变（自定义 2~4 个颜色，可调整渐变角度 0~360°）
  *      渐变带霓虹光晕开关与强度调节（逐字同色 text-shadow，蓝段蓝光、黄段黄光）
- * 3. 渐变粒度：主要文本 = 整条消息；斜体 = 每个 em 段落；引用 = 每个 q / blockquote 整段。
+ * 3. 渐变粒度：主要文本 = 整条消息；斜体 = 每个 em 段落；引用 = 每个句子独立循环（句子内按字符顺序首→尾）。
  * 4. 内置 10 套配色预设 + 3 套可保存的自定义预设。
  * 5. 设置面板跟随酒馆主题与字体大小，顶部横排文字类型标签切换。
  *
  * 性能设计：
  * - 逐字染色按需触发（设置变化 / 生成结束 / 进入视口），每字同色 text-shadow 不创建合成层；
- *   流式期间以元素级渐变（background-clip:text）近似兜底 + 稳定窗口门控，
- *   生成结束后自动逐字精确校正为每字同色光晕。
+ *   流式期间以元素级渐变（background-clip:text）完整兜底（含渐变与光晕），
+ *   生成结束后自动逐字精确校正为每字同色光晕；外部改动消息 DOM 时自动重新染色。
  */
 (() => {
     'use strict';
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.1.15';
+    const VERSION = '1.1.16';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
     const MAX_STOPS = 4;
     const MIN_STOPS = 2;
 
-    // 句子结束符（保留：测试与历史兼容；引用渐变自 v1.1.3 起改为按引号对分段）
+    // 句子结束符：引用渐变按「每个句子」分段，每个句子（含结束符）为独立渐变循环。
     const SENTENCE_END = /[。！？!?…\n]/;
-
-    // 引用渐变按「六种引号对」分段：每对引号连同其中文字（含开闭引号）作为独立渐变循环。
-    // 开闭同字符（toggle）：英文 "、全角 ＂；开闭不同字符：中文 “”、直角 「」、双直角 『』、法语 «»
-    const QUOTE_TOGGLE = new Set(['"', '＂']);
-    const QUOTE_OPEN = new Set(['“', '「', '『', '«']);
-    const QUOTE_CLOSE = new Set(['”', '」', '』', '»']);
 
     // 10 套内置预设（三段色标）
     const PRESETS = [
@@ -286,27 +280,17 @@
         return Array.from(s);
     }
 
-    // 把一段字符按六种引号对切成渐变段：返回每字符的段号数组。
-    // 每对引号（含开闭引号）为独立段，引号外文字各自成段；baseGid/startInQuote 用于跨文本节点续接，
-    // 返回结束时的 gid 与 inQuote 以便后续节点继续分段。
-    function quoteSegments(chars, baseGid = 0, startInQuote = false) {
+    // 把一段字符按句子结束符切成渐变段：返回每字符的段号数组与结束段号。
+    // 每个句子（含结束符）为独立渐变循环，句子内按字符顺序首色→尾色线性取色；
+    // 不再按引号对分段——跨行引号对会被空间投影反转方向（一行尾色、下一行首色）。
+    function sentenceSegments(chars, baseGid = 0) {
         const segs = [];
         let gid = baseGid;
-        let inQuote = startInQuote;
         for (const ch of chars) {
-            let closedNow = false;
-            if (QUOTE_TOGGLE.has(ch)) {
-                if (!inQuote) { gid++; inQuote = true; }   // 开引号：新段
-                else { inQuote = false; closedNow = true; } // 闭引号：字归当前段
-            } else if (QUOTE_OPEN.has(ch)) {
-                if (!inQuote) { gid++; inQuote = true; }   // 明确开引号
-            } else if (QUOTE_CLOSE.has(ch)) {
-                if (inQuote) { inQuote = false; closedNow = true; } // 明确闭引号
-            }
             segs.push(gid);
-            if (closedNow) gid++; // 闭引号后：后续文字新段
+            if (SENTENCE_END.test(ch)) gid++;
         }
-        return { segs, gid, inQuote };
+        return { segs, gid };
     }
 
     // 渐变色标：2~4 色数组，非法时兜底双白
@@ -348,8 +332,6 @@
     let paintTimer = null;
     let repaintTimer = null;
     let colorCssTimer = null;    // 配色 CSS 重载防抖计时器（消息 DOM 重建后兜底）
-    const mutTs = new Map();      // 每条消息最近一次 DOM 变动时间（流式稳定门控）
-    const STREAM_SETTLE_MS = 600; // 距上次变动不足此时长时跳过逐字精确化，交给 CSS 近似兜底
     let booted = false;
     let uiBuilt = false;
     let uiTimerId = null;
@@ -609,11 +591,10 @@
         let key = groups.get(container);
         if (!key) { key = new Map(); groups.set(container, key); }
         let gid = 0;
-        let inQuote = false; // 引号对状态（跨文本节点保持）
-        const byQuote = granularity === 'sentence';
+        const bySentence = granularity === 'sentence'; // 引用：每个句子独立循环
         const getList = (g) => {
             let L = key.get(g);
-            if (!L) { L = { spans: [], cfg, stops }; key.set(g, L); }
+            if (!L) { L = { spans: [], cfg, stops, order: bySentence }; key.set(g, L); }
             return L;
         };
         for (const n of collectText(el, extraSkip)) {
@@ -621,9 +602,9 @@
             const chars = graphemes(n.nodeValue || '');
             if (!chars.length) continue;
             const frag = document.createDocumentFragment();
-            if (byQuote) {
-                // 六种引号对分段：每对引号连同内容（含引号）为独立渐变循环；引号外文字各自成段
-                const r = quoteSegments(chars, gid, inQuote);
+            if (bySentence) {
+                // 每个句子独立渐变循环（含结束符）；句子内按字符顺序首→尾线性取色
+                const r = sentenceSegments(chars, gid);
                 for (let i = 0; i < chars.length; i++) {
                     const g = r.segs[i];
                     const sp = document.createElement('span');
@@ -635,7 +616,6 @@
                     getList(g).spans.push(sp);
                 }
                 gid = r.gid;
-                inQuote = r.inQuote;
             } else {
                 for (const ch of chars) {
                     const sp = document.createElement('span');
@@ -681,6 +661,18 @@
                 const strength = cfg.glow
                     ? Math.max(0, Math.min(1, (Number(cfg.strength) || 0) / 100))
                     : 0;
+                if (item.order) {
+                    // 每个句子独立循环：按字符顺序线性取色（首→尾），不走空间投影，避免跨行方向反转
+                    for (let i = 0; i < n; i++) {
+                        const T = (n === 1) ? 0 : i / (n - 1);
+                        const hex = colorAt(stops, T);
+                        const sp = spans[i];
+                        sp.style.setProperty('color', hex, 'important');
+                        sp.style.setProperty('-webkit-text-fill-color', hex, 'important');
+                        sp.style.setProperty('text-shadow', glowShadow(hex, strength), 'important');
+                    }
+                    continue;
+                }
                 const ts = hasBox ? new Array(n) : null;
                 let tmin = Infinity, tmax = -Infinity;
                 if (hasBox) {
@@ -766,61 +758,14 @@
         applyMes(m);
     }
 
-    // 流式生成期间增量上色：只染新增文本节点，颜色按当前字符序号近似映射，
-    // 不做整条重排，避免逐 token 重染闪烁；生成结束后 repaintAll 统一按真实位置校正。
-    // 稳定窗口门控：消息最近刚被酒馆重建时跳过逐字精确化（CSS 近似兜底已着色），
-    // 待 DOM 稳定后再补精确渐变，避免「酒馆重建 → 原生色 → 重新 wrap」的闪烁循环。
+    // 流式生成期间只打兜底标记：让元素级渐变 CSS（buildStreamCss）呈现完整渐变 + 光晕。
+    // 不再逐字 wrap——逐字增量把新增文字按「整条累计序号」映射成接近尾色，会冲掉完整渐变
+    // （流式期间首色/粉色缺失、颜色寡淡），且每 chunk 重建会反复 wrap 造成闪烁。
+    // 生成结束后 repaintAll 统一按真实位置逐字精确校正为每字同色光晕。
     function paintStreamChunk(mes) {
-        const mt = mes.querySelector('.mes_text');
-        if (!mt) return;
+        if (!mes || !mes.isConnected) return;
         if (settings.enabled === false) return;
-        mes.setAttribute('data-yyx-stream', '1'); // 先保证 CSS 近似兜底生效
-        const last = mutTs.get(mes);
-        if (last && Date.now() - last < STREAM_SETTLE_MS) return; // 变动太频繁，交给 CSS 近似兜底
-        const nodes = [];
-        const w = document.createTreeWalker(mt, NodeFilter.SHOW_TEXT);
-        let n;
-        while ((n = w.nextNode())) {
-            const p = n.parentNode;
-            if (!p) continue;
-            if (p.closest('code, pre')) continue;
-            // 只跳过父级本身就是染色 span 的节点；消息级 data-yyx 标记不能跳过新增 token
-            if (p.hasAttribute && p.hasAttribute('data-yyx')) continue;
-            nodes.push(n);
-        }
-        if (!nodes.length) return;
-        let existing = mt.querySelectorAll('.yyx-ch').length;
-        for (const node of nodes) {
-            if (!node.nodeValue.trim()) continue;
-            const anc = node.parentNode;
-            const em = anc.closest('em');
-            const qq = anc.closest('q, blockquote');
-            let cfg = settings.main;
-            if (em) cfg = settings.italic;
-            else if (qq) cfg = settings.quote;
-            if (!cfg || cfg.mode === 'theme') continue;
-            if (cfg.mode === 'solid') { wrapSolidText(node, cfg.color); continue; }
-            const stops = stopsOf(cfg);
-            const chars = graphemes(node.nodeValue || '');
-            if (!chars.length) continue;
-            const strength = cfg.glow ? Math.min(1, Math.max(0, (Number(cfg.strength) || 0) / 100)) : 0;
-            const total = existing + chars.length;
-            const frag = document.createDocumentFragment();
-            for (let i = 0; i < chars.length; i++) {
-                const t = total <= 1 ? 0 : (existing + i) / (total - 1);
-                const hex = colorAt(stops, t);
-                const sp = document.createElement('span');
-                sp.className = 'yyx-ch';
-                sp.setAttribute('data-yyx', 'ch');
-                sp.textContent = chars[i];
-                sp.style.setProperty('color', hex, 'important');
-                sp.style.setProperty('-webkit-text-fill-color', hex, 'important');
-                sp.style.setProperty('text-shadow', glowShadow(hex, strength), 'important');
-                frag.appendChild(sp);
-            }
-            node.parentNode.replaceChild(frag, node);
-            existing += chars.length;
-        }
+        mes.setAttribute('data-yyx-stream', '1');
     }
 
     // 重新渲染：已染色消息 + 视口附近的未染色消息
@@ -845,7 +790,6 @@
             for (const m of c.querySelectorAll('.mes[data-yyx-stream]')) {
                 if (m.dataset.yyx === '1') m.removeAttribute('data-yyx-stream');
             }
-            mutTs.clear();
         } finally {
             applying = false;
         }
@@ -903,10 +847,9 @@
     function onChatMutation(muts) {
         if (applying) return;
         const targets = new Set();
-        const now = Date.now();
         for (const mu of muts) {
             if (mu.type === 'characterData') {
-                // 酒馆流式时可能直接改 textContent：同样会清掉染色结构，需要兜底与稳定门控
+                // 酒馆流式时可能直接改 textContent：同样会清掉染色结构，需要兜底
                 const el = mu.target && mu.target.parentNode;
                 const mes = el && el.closest ? el.closest('.mes') : null;
                 if (mes) targets.add(mes);
@@ -922,7 +865,10 @@
         }
         if (!targets.size) return;
         for (const m of targets) {
-            mutTs.set(m, now);
+            // 酒馆/外部改动了消息 DOM（流式重建、编辑、swipe、删除重插等）会抹掉逐字 span，
+            // 清除「已处理」标记，强制重新染色，避免 maybeProcess 误判跳过而落回酒馆原生色。
+            delete m.dataset.yyx;
+            delete m.dataset.yyxRev;
             if (streaming) m.setAttribute('data-yyx-stream', '1');
             observeMes(m);
         }
@@ -1433,13 +1379,12 @@
     if (typeof module !== 'undefined' && module.exports) {
         module.exports = {
             VERSION, MODULE, TARGET_KEYS, TARGET_LABELS, PRESETS, SENTENCE_END,
-            colorAt, glowShadow, graphemes, stopsOf, quoteSegments, approxOf, streamDecl, buildStreamCss,
+            colorAt, glowShadow, graphemes, stopsOf, sentenceSegments, approxOf, streamDecl, buildStreamCss,
             gradientTextCss, glowFilter, targetDecl, buildColorCss, clearAllSpans,
             hexToRgb, rgbToHex, normHex, rgbToHsv, hsvToRgb, hexToHsv, hsvToHex,
             collectText, applyMes, restoreMes, finalizeGroups, applyGradientStyle, paintStreamChunk,
             _setSettingsForTest: (s) => { settings = s; rev = JSON.stringify(settings); },
             _getSettingsForTest: () => settings,
-            _setMutTsForTest: (mes, ts) => { if (ts == null) mutTs.delete(mes); else mutTs.set(mes, ts); },
             _stopTimers: () => {
                 if (uiTimerId) { clearInterval(uiTimerId); uiTimerId = null; }
                 if (uiCapTimerId) { clearTimeout(uiCapTimerId); uiCapTimerId = null; }
