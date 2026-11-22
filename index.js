@@ -1,5 +1,5 @@
 /*!
- * 聊天文字调色 v1.1.16
+ * 聊天文字调色 v1.1.17
  * SillyTavern UI 扩展
  *
  * 功能：
@@ -23,7 +23,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.1.16';
+    const VERSION = '1.1.17';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -770,6 +770,10 @@
 
     // 重新渲染：已染色消息 + 视口附近的未染色消息
     function repaintAll() {
+        // 流式生成期间绝不逐字校正：此时交由元素级渐变 CSS（data-yyx-stream）稳定兜底。
+        // 若在此逐字 wrap，会与每个 chunk 重建的兜底渐变反复交替，表现为「一闪一闪」。
+        // 生成结束（streaming=false）后再统一逐字精确校正。
+        if (streaming) return;
         const c = chat.el;
         if (!c || !c.isConnected) return;
         applying = true;
@@ -1382,9 +1386,11 @@
             colorAt, glowShadow, graphemes, stopsOf, sentenceSegments, approxOf, streamDecl, buildStreamCss,
             gradientTextCss, glowFilter, targetDecl, buildColorCss, clearAllSpans,
             hexToRgb, rgbToHex, normHex, rgbToHsv, hsvToRgb, hexToHsv, hsvToHex,
-            collectText, applyMes, restoreMes, finalizeGroups, applyGradientStyle, paintStreamChunk,
+            collectText, applyMes, restoreMes, finalizeGroups, applyGradientStyle, paintStreamChunk, repaintAll,
             _setSettingsForTest: (s) => { settings = s; rev = JSON.stringify(settings); },
             _getSettingsForTest: () => settings,
+            _setStreamingForTest: (v) => { streaming = v; },
+            _reinitChatForTest: () => { chat.el = document.getElementById('chat'); },
             _stopTimers: () => {
                 if (uiTimerId) { clearInterval(uiTimerId); uiTimerId = null; }
                 if (uiCapTimerId) { clearTimeout(uiCapTimerId); uiCapTimerId = null; }
