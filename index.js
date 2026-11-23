@@ -23,7 +23,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.2.1';
+    const VERSION = '1.2.2';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -413,6 +413,50 @@
     let colorCssTimer = null;    // 配色 CSS 重载防抖计时器（消息 DOM 重建后兜底）
     let restyleTimer = null;      // 原地重刷（改强度/光晕，不拆 span）
     let lastSig = '';             // 上次的结构签名（模式/色标/角度），决定要不要重建 span
+
+    // 闪烁监测：流式期间逐帧采样「屏幕上最新那条消息是否已有逐字 span」。
+    // 只要有一帧拍到裸状态（无 span = 元素级路径 = 该设备可能不出光），就会被计入。
+    const flicker = {
+        raf: null, frames: 0, bareFrames: 0, bareLastAt: null, bareLastLen: null,
+        sync: 0, deferred: 0, fail: 0, lastMs: 0, maxMs: 0, reason: {},
+        reset() {
+            this.frames = 0; this.bareFrames = 0; this.bareLastAt = null; this.bareLastLen = null;
+            this.sync = 0; this.deferred = 0; this.fail = 0; this.lastMs = 0; this.maxMs = 0; this.reason = {};
+        },
+    };
+
+    function lastMes() {
+        const c = chat.el || document.getElementById('chat');
+        if (!c) return null;
+        const list = c.querySelectorAll('.mes');
+        return list.length ? list[list.length - 1] : null;
+    }
+
+    function probeFrame() {
+        if (!streaming) { flicker.raf = null; return; }
+        flicker.frames++;
+        const m = lastMes();
+        if (m) {
+            const mt = m.querySelector('.mes_text');
+            const hasText = mt && (mt.textContent || '').trim().length > 0;
+            const painted = m.dataset.yyx === '1' && !!m.querySelector('[data-yyx="ch"], [data-yyx="sol"]');
+            if (hasText && !painted) {
+                flicker.bareFrames++;
+                flicker.bareLastAt = new Date().toISOString();
+                flicker.bareLastLen = (mt.textContent || '').length;
+                flicker.reason.bare = (flicker.reason.bare || 0) + 1;
+            }
+        }
+        flicker.raf = (typeof requestAnimationFrame === 'function')
+            ? requestAnimationFrame(probeFrame)
+            : (setTimeout(probeFrame, 32), null);
+    }
+
+    function startProbe() {
+        if (typeof requestAnimationFrame !== 'function') return;
+        if (flicker.raf) return;
+        flicker.raf = requestAnimationFrame(probeFrame);
+    }
     let booted = false;
     let uiBuilt = false;
     let uiTimerId = null;
@@ -1111,15 +1155,20 @@
                 text: el.textContent.slice(0, 24),
             };
         });
-        const messages = [...document.querySelectorAll('#chat .mes')].slice(0, 4).map((m, i) => ({
-            i,
+        // 同样只抽样「最新的几条」，最早的消息在视口外本来就按设计不染色
+        const all = [...document.querySelectorAll('#chat .mes')];
+        const messages = all.slice(-4).map((m, idx) => ({
+            i: all.length - 4 + idx,
             done: m.dataset.yyx === '1',
             stream: m.hasAttribute('data-yyx-stream'),
+            chars: ((m.querySelector('.mes_text') || {}).textContent || '').length,
+            spans: m.querySelectorAll('[data-yyx="ch"], [data-yyx="sol"]').length,
             em: pick(m.querySelectorAll('em, i')),
             quote: pick(m.querySelectorAll('q, blockquote')),
         }));
         const table = (id) => { const t = document.getElementById(id); return t ? t.textContent.slice(0, 300) : null; };
         const c = document.getElementById('chat');
+        const last = all.length ? all[all.length - 1] : null;
         return {
             version: VERSION,
             streaming,
@@ -1127,6 +1176,27 @@
             chatClass: c ? c.className : null,
             chatFound: !!c,
             settings: TARGET_KEYS.reduce((o, k) => { o[k] = settings[k]; return o; }, {}),
+            // 闪烁监测：流式期间逐帧采样，bareFrames > 0 说明确实存在「无 span」的画面
+            flicker: {
+                frames: flicker.frames,
+                bareFrames: flicker.bareFrames,
+                bareRate: flicker.frames ? +(flicker.bareFrames / flicker.frames).toFixed(3) : 0,
+                bareLastAt: flicker.bareLastAt,
+                bareLastLen: flicker.bareLastLen,
+                syncPaints: flicker.sync,
+                deferredPaints: flicker.deferred,
+                failedPaints: flicker.fail,
+                lastPaintMs: flicker.lastMs,
+                maxPaintMs: flicker.maxMs,
+                reasons: flicker.reason,
+            },
+            lastMes: last ? {
+                done: last.dataset.yyx === '1',
+                stream: last.hasAttribute('data-yyx-stream'),
+                chars: ((last.querySelector('.mes_text') || {}).textContent || '').length,
+                spans: last.querySelectorAll('[data-yyx="ch"], [data-yyx="sol"]').length,
+                syncLimit: SYNC_PAINT_MAX_CHARS,
+            } : null,
             now: snapshotState().items,
             afterEnd: endSnapshots,
             messages,
@@ -1233,10 +1303,14 @@
             // 关键：MutationObserver 回调在浏览器绘制之前执行，
             // 这里同步重染，可以让这一帧直接是「逐字上色 + 逐字光晕」，
             // 不会先露出一帧「无 span」的中间态（那正是流式闪烁的来源）。
-            // 代价是每个 chunk 有一次同步重排，长消息超过阈值时退回防抖，避免手机端卡顿。
-            if (streaming && syncPaintable(m)) {
-                paintNow(m, false);
-                continue;
+            // 同步重染对长消息也是必须的：一旦退回防抖，中间几帧就只剩元素级 CSS，
+            // 而元素级路径在部分手机浏览器上根本不出光 → 有光/无光交替。
+            if (streaming) {
+                if (syncPaintable(m)) {
+                    paintNow(m, false);
+                    continue;
+                }
+                flicker.deferred++; flicker.reason.tooLong = (flicker.reason.tooLong || 0) + 1;
             }
             if (streaming) m.setAttribute('data-yyx-stream', '1');
             deferred.push(m);
@@ -1247,21 +1321,27 @@
     // 同步重染：出错绝不能把异常抛回 MutationObserver（会让后续 chunk 全部丢失），一律吞掉并退回防抖路径。
     function paintNow(m, incremental) {
         applying = true;
+        const t0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
         try {
             if (incremental && m.dataset.yyx === '1') paintChars(m);
             else paintStreamChunk(m);
+            flicker.sync++;
         } catch (e) {
             console.warn(TAG, 'sync paint failed', e);
+            flicker.fail++;
             m.setAttribute('data-yyx-stream', '1');
             scheduleMes([m]);
         } finally {
+            const dt = ((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - t0;
+            flicker.lastMs = Math.round(dt);
+            if (dt > flicker.maxMs) flicker.maxMs = Math.round(dt);
             applying = false;
         }
     }
 
-    // 同步重染的开销与字符数成正比，超长消息在手机端逐 chunk 同步重排会卡；
-    // 这里给一个上限，超出就退回 60ms 防抖（这类消息通常是历史长文，不是正在流出的新消息）。
-    const SYNC_PAINT_MAX_CHARS = 2200;
+    // 同步重染的上限只作为「极端兜底」：正常消息一律同步，
+    // 上限放得很宽（>2 万字的历史长文才会走防抖），否则正在流出的长回复会持续闪烁。
+    const SYNC_PAINT_MAX_CHARS = 20000;
     function syncPaintable(m) {
         if (!m || !m.isConnected) return false;
         const mt = m.querySelector('.mes_text');
@@ -1309,6 +1389,8 @@
 
         on('GENERATION_STARTED', () => {
             streaming = true;
+            flicker.reset();
+            startProbe();
             if (chat.el) chat.el.classList.add('yyx-streaming'); // 流式类：未染色消息立即命中元素级渐变兜底
             if (streamTimer) clearTimeout(streamTimer);
             streamTimer = setTimeout(() => {
@@ -1873,6 +1955,7 @@
                 if (repaintTimer) { clearTimeout(repaintTimer); repaintTimer = null; }
                 if (colorCssTimer) { clearTimeout(colorCssTimer); colorCssTimer = null; }
                 if (restyleTimer) { clearTimeout(restyleTimer); restyleTimer = null; }
+                if (flicker.raf && typeof cancelAnimationFrame === 'function') { cancelAnimationFrame(flicker.raf); flicker.raf = null; }
                 while (snapTimers.length) { clearTimeout(snapTimers.pop()); }
             },
         };
