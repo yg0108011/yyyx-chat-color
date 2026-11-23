@@ -1,5 +1,5 @@
 /*!
- * 聊天文字调色 v1.1.22
+ * 聊天文字调色 v1.1.23
  * SillyTavern UI 扩展
  *
  * 功能：
@@ -23,7 +23,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.1.22';
+    const VERSION = '1.1.23';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -516,6 +516,7 @@
 .yyx-stoprow .yyx-sw { width: 1.4em; height: 1.4em; border-radius: 5px; }
 .yyx-in { flex: 1 1 70px; min-width: 56px; padding: 3px 7px; border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,.15)); border-radius: 6px; background: var(--SmartThemeBlurTintColor, rgba(0,0,0,.2)); color: var(--SmartThemeBodyColor, #e6e6e6); }
 .yyx-in:focus { outline: none; border-color: var(--SmartThemeQuoteColor, rgba(255,255,255,.4)); }
+.yyx-debug-out { width: 100%; margin-top: 6px; font-size: .82em; line-height: 1.4; resize: vertical; }
 .yyx-range { flex: 1 1 100px; }
 .yyx-val { min-width: 2.8em; text-align: right; font-variant-numeric: tabular-nums; opacity: .9; }
 .yyx-presets { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 4px; }
@@ -1439,7 +1440,9 @@
             <div class="yyx-row">
               <button type="button" class="menu_button yyx-reset">全部恢复跟随主题</button>
               <button type="button" class="menu_button yyx-repaint">重新渲染可见消息</button>
+              <button type="button" class="menu_button yyx-debug">诊断信息</button>
             </div>
+            <textarea class="yyx-debug-out" rows="7" readonly hidden placeholder="点「诊断信息」后在此显示当前设置与命中状态，可长按复制或截图发给作者"></textarea>
           </div>
         </div>`);
         $root.append($panel);
@@ -1469,6 +1472,16 @@
 
         $panel.find('.yyx-reset').on('click', resetAll);
         $panel.find('.yyx-repaint').on('click', () => { clearAllSpans(); scheduleRepaint(50); });
+        // 诊断信息：把当前设置、消息标签命中、逐字 span 与内联光晕、配色表规则填到文本框，
+        // 手机端无 F12 控制台也能直接截图/长按复制反馈。
+        $panel.find('.yyx-debug').on('click', () => {
+            const $out = $panel.find('.yyx-debug-out');
+            const text = JSON.stringify(debugInfo(), null, 2);
+            $out.val(text).prop('hidden', false);
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).catch(() => { /* 剪贴板不可用则保留在文本框 */ });
+            }
+        });
         refreshAllUI();
     }
 
