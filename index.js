@@ -24,7 +24,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.2.10';
+    const VERSION = '1.2.11';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -341,6 +341,7 @@
             delete m.dataset.yyxRev;
             delete m.dataset.yyxStream;
         }
+        for (const q of document.querySelectorAll('#chat .mes q, #chat .mes blockquote')) QSTATE.delete(q);
     }
 
     // 按字素拆分（避免 emoji 组合序列被拆坏）
@@ -453,10 +454,13 @@
         // fallbackFrames = 尾条消息处于「元素级兜底」的帧数（按设计允许，流式全程应如此）
         // switches = 尾条消息在「兜底」与「逐字 span」之间来回切换的次数（目标必须是 0）
         fallbackFrames: 0, switches: 0, lastMode: null,
+        // v1.2.11：同为逐字 span 的帧之间，首/尾字颜色仍在粉↔蓝之间振荡
+        colorSwitches: 0, lastColorSig: null,
         reset() {
             this.frames = 0; this.bareFrames = 0; this.bareLastAt = null; this.bareLastLen = null;
             this.sync = 0; this.deferred = 0; this.fail = 0; this.lastMs = 0; this.maxMs = 0; this.reason = {};
             this.fallbackFrames = 0; this.switches = 0; this.lastMode = null;
+            this.colorSwitches = 0; this.lastColorSig = null;
         },
     };
 
@@ -494,6 +498,22 @@
         return list.length ? list[list.length - 1] : null;
     }
 
+    // v1.2.11：取尾条消息首/个斜体、引用宿主的 span 数与首/尾字颜色，
+    // 作为一帧的「颜色签名」；两帧签名不同 = 肉眼可见的粉↔蓝振荡。
+    function colorSample(m) {
+        const mt = m.querySelector('.mes_text');
+        if (!mt) return '';
+        const hostInfo = (sel) => {
+            const el = mt.querySelector(sel);
+            if (!el) return 'x';
+            const sp = [...el.querySelectorAll('[data-yyx="ch"]')];
+            if (!sp.length) return 'e0';
+            const fill = (s) => s.style.getPropertyValue('-webkit-text-fill-color') || s.style.color || '';
+            return `${sp.length}:${fill(sp[0])}~${fill(sp[sp.length - 1])}`;
+        };
+        return 'em[' + hostInfo('em, i') + ']q[' + hostInfo('q, blockquote') + ']';
+    }
+
     function probeFrame() {
         if (!streaming) { flicker.raf = null; return; }
         flicker.frames++;
@@ -520,6 +540,17 @@
                     flicker.reason.switch = (flicker.reason.switch || 0) + 1;
                 }
                 flicker.lastMode = mode;
+                // 同为 span 帧：首/尾字颜色签名变了也算振荡（旧探针抓不到这种）
+                if (painted) {
+                    const sig = colorSample(m);
+                    if (flicker.lastColorSig && flicker.lastColorSig !== sig) {
+                        flicker.colorSwitches++;
+                        flicker.reason.color = (flicker.reason.color || 0) + 1;
+                    }
+                    flicker.lastColorSig = sig;
+                } else {
+                    flicker.lastColorSig = null;
+                }
             }
         }
         flicker.raf = (typeof requestAnimationFrame === 'function')
@@ -858,6 +889,9 @@
         if (colorCssTimer) clearTimeout(colorCssTimer);
         colorCssTimer = setTimeout(() => {
             colorCssTimer = null;
+            // 流式期间绝不拆 span：事件若在吐字途中触发（部分后端会按 chunk 派发 MESSAGE_RECEIVED），
+            // 拆完再防抖重染会留出一段元素级兜底帧，正是粉↔蓝交替的来源；这里只刷新 CSS 规则。
+            if (streaming) { updateColorCss(); updateStreamCss(); return; }
             clearAllSpans();
             reloadColorCss();
             scheduleRepaint(50);
@@ -1105,6 +1139,9 @@
         for (const el of mes.querySelectorAll('.mes_text, .mes_text em, .mes_text i, .mes_text q, .mes_text blockquote')) {
             delete el.dataset.yyxG;
         }
+        // v1.2.11：引号开合状态一并作废。整段重建后若沿用上一帧残留的 inQuote 状态，
+        // 新引号会被误判成闭引号，分段/组号在帧之间漂移，尾字取色位置随之粉↔蓝振荡。
+        for (const q of mes.querySelectorAll('q, blockquote')) QSTATE.delete(q);
     }
 
     const MES_SIG = new WeakMap();   // 消息上次染完时的纯文本指纹（用于忽略自己写入产生的 DOM 回声）
@@ -1436,6 +1473,8 @@
                 // switches（兜底↔逐字来回切）必须是 0，>0 就说明还在闪。
                 fallbackFrames: flicker.fallbackFrames,
                 modeSwitches: flicker.switches,
+                colorSwitches: flicker.colorSwitches,
+                lastColorSig: flicker.lastColorSig,
             },
             // 流式锁定：marked = 这一轮被锁定（保持元素级兜底）的消息数，
             // skips = 各条渲染路径因为锁定而跳过的次数（它替我们挡掉了多少次整条重建）
@@ -1446,6 +1485,23 @@
                 const cache = PAINT_CACHE.get(last);
                 const total = (mt ? mt.textContent : '').length;
                 const spans = last.querySelectorAll('[data-yyx="ch"], [data-yyx="sol"]').length;
+                // v1.2.11：列出前 6 个斜体/引用宿主的 span 数与首/尾字颜色，
+                // 用来判断振荡到底是「整段一个渐变」还是「每行一个渐变」，以及兜底 CSS 是否透出。
+                const hosts = [];
+                if (mt) {
+                    for (const el of [...mt.querySelectorAll('em, i, q, blockquote')].slice(0, 6)) {
+                        const hsp = [...el.querySelectorAll('[data-yyx="ch"]')];
+                        const hfill = (s) => s.style.getPropertyValue('-webkit-text-fill-color') || s.style.color || null;
+                        hosts.push({
+                            tag: el.tagName.toLowerCase(),
+                            n: hsp.length,
+                            first: hsp[0] ? hfill(hsp[0]) : null,
+                            last: hsp[hsp.length - 1] ? hfill(hsp[hsp.length - 1]) : null,
+                            fill: computedOf(el, '-webkit-text-fill-color'),
+                            text: el.textContent.slice(0, 16),
+                        });
+                    }
+                }
                 return {
                     done: last.dataset.yyx === '1',
                     stream: last.hasAttribute('data-yyx-stream'),
@@ -1464,6 +1520,8 @@
                     })(),
                     mesFill: computedOf(mt, '-webkit-text-fill-color'),
                     syncLimit: SYNC_PAINT_MAX_CHARS,
+                    html: mt ? mt.innerHTML.slice(0, 1200) : null,
+                    hosts,
                 };
             })() : null,
             // 观察器健康度：容器是否被酒馆重建、观察器是否还挂在活节点上
