@@ -23,7 +23,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.2.2';
+    const VERSION = '1.2.3';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -457,6 +457,127 @@
         if (flicker.raf) return;
         flicker.raf = requestAnimationFrame(probeFrame);
     }
+
+    // ===== 诊断时间线（最近 60 条事件，随诊断信息一起导出） =====
+    // 闪烁类问题只有「事件顺序」能说明问题：谁在什么时候拆了 span、什么时候补上。
+    const timeline = [];
+    let lastMutAt = 0;
+    let mutCount = 0;
+    function note(kind, detail) {
+        timeline.push({ t: Date.now() % 1000000, k: kind, d: detail || '' });
+        if (timeline.length > 60) timeline.shift();
+    }
+
+    // ===== 同步守护（对应「前十几秒不闪、之后开始闪」「重启后几秒才有光晕」） =====
+    // 每帧只做一次极便宜的判定：这条消息的文本比上次染完时长，或 span 变少了 → 立刻同步补染。
+    // 不依赖 MutationObserver 是否健全，所以容器重建 / 观察器丢失 / 事件漏发都能自愈。
+    const PAINT_CACHE = new WeakMap();   // 染完时记下 {total, spans}，作为"是否需要再染"的基线
+    const guard = {
+        raf: null, frames: 0, fixes: 0, lastFixAt: 0, lastFixChars: 0, bareGlowFrames: 0,
+    };
+
+    // 酒馆切聊天/重启后会重建 #chat 容器；观察器若绑在旧节点上，之后的 chunk 全都收不到通知。
+    function chatLive() {
+        const c = document.getElementById('chat');
+        if (!c) return chat.el;
+        if (c !== chat.el) {
+            chat.el = c;
+            ensureObservers();
+            note('chat-rebind', '容器重建');
+        }
+        return chat.el;
+    }
+
+    function mesNeedsPaint(m) {
+        if (!m || !m.isConnected) return false;
+        const mt = m.querySelector('.mes_text');
+        if (!mt || !(mt.textContent || '').trim()) return false;
+        if (m.dataset.yyx !== '1' || m.dataset.yyxSig !== structSig()) return true;
+        const c = PAINT_CACHE.get(m);
+        if (!c) return true;
+        const total = (mt.textContent || '').length;
+        const spans = m.querySelectorAll('[data-yyx="ch"], [data-yyx="sol"]').length;
+        return total > c.total || spans < c.spans;
+    }
+
+    function tailMes(limit) {
+        const c = chat.el;
+        if (!c) return [];
+        const all = c.querySelectorAll('.mes');
+        const out = [];
+        for (let i = all.length - 1; i >= 0 && out.length < limit; i--) out.push(all[i]);
+        return out;
+    }
+
+    function guardTick() {
+        guard.raf = null;
+        if (!streaming) return;
+        guard.frames++;
+        const vh = window.innerHeight || 900;
+        let fixed = 0;
+        for (const m of tailMes(3)) {
+            if (!m.isConnected) continue;
+            const r = m.getBoundingClientRect();
+            if (r.bottom < -vh * 0.5) continue;
+            if (!mesNeedsPaint(m)) continue;
+            const mt = m.querySelector('.mes_text');
+            guard.lastFixChars = mt ? (mt.textContent || '').length : 0;
+            paintNow(m, m.dataset.yyx === '1');
+            fixed++;
+        }
+        if (fixed) { guard.fixes += fixed; guard.lastFixAt = Date.now(); note('guard', fixed); }
+        guard.raf = requestAnimationFrame(guardTick);
+    }
+
+    function startGuard() {
+        if (typeof requestAnimationFrame !== 'function') return;
+        if (!guard.raf) guard.raf = requestAnimationFrame(guardTick);
+    }
+
+    function stopGuard() {
+        if (guard.raf) {
+            try { cancelAnimationFrame(guard.raf); } catch { /* 忽略 */ }
+            guard.raf = null;
+        }
+    }
+
+    // 一次性修复：只碰「视口附近且确实缺染色」的消息，开销极小，可以放心在启动阶段连打几枪。
+    function repairVisible(tag) {
+        const c = chatLive();
+        if (!c || settings.enabled === false) return 0;
+        const vh = window.innerHeight || 900;
+        let fixed = 0;
+        for (const m of tailMes(40)) {
+            if (!m.isConnected) continue;
+            const rr = m.getBoundingClientRect();
+            if (rr.width === 0 && rr.height === 0) continue;
+            if (rr.bottom < -vh || rr.top > vh * 2) continue;
+            if (!mesNeedsPaint(m)) continue;
+            applying = true;
+            try {
+                if (m.dataset.yyx === '1') paintChars(m);
+                else if (streaming) paintStreamChunk(m);
+                else maybeProcess(m);
+                fixed++;
+            } catch (e) { console.warn(TAG, 'repair failed', e); }
+            finally { applying = false; }
+        }
+        if (fixed) note('repair:' + (tag || ''), fixed);
+        return fixed;
+    }
+
+    // 启动/切换聊天时连打几枪：手机端布局慢，一次可能全部「宽高为 0」被跳过，
+    // 这正是「重启后先有渐变、几秒后才冒光晕」的成因。
+    let burstTimers = [];
+    function fastPaintBurst() {
+        for (const t of burstTimers) clearTimeout(t);
+        burstTimers = [];
+        repairVisible('now');
+        if (typeof requestAnimationFrame === 'function') requestAnimationFrame(() => repairVisible('raf'));
+        for (const ms of [120, 350, 800, 1600]) {
+            burstTimers.push(setTimeout(() => repairVisible('burst'), ms));
+        }
+    }
     let booted = false;
     let uiBuilt = false;
     let uiTimerId = null;
@@ -812,10 +933,19 @@
     // 若每次都全量写 DOM，手机端会明显抖动；这里只写「颜色真的变了」的那几个字。
     const SPAN_CACHE = new WeakMap();
 
+    // 流式期间的「整组重算」节流：长引用/长斜体每来一个 chunk 都要把所有已染色字的色值重算一遍，
+    // 手机端会产生每帧上千次样式写入（表现为密集的小幅重绘，看起来就像在闪）。
+    // 这里在流式期间最多每 STREAM_FINALIZE_GAP 毫秒整组刷新一次；新字（没有缓存）始终立即上色。
+    const STREAM_FINALIZE_GAP = 200;
+    const LAST_FINALIZE = new WeakMap();
+    let applyOnlyNew = false;
+    let forceFullFinalize = false;
+
     function applySpan(sp, hex, strength) {
         const prev = SPAN_CACHE.get(sp);
         const key = hex + '|' + strength;
-        if (prev && prev.k === key) return;
+        // 节流窗口内：已上过色的字保持原样，只保证「还没有颜色」的新字立刻上色
+        if (prev && (prev.k === key || applyOnlyNew)) return;
         SPAN_CACHE.set(sp, { k: key });
         sp.style.setProperty('color', hex, 'important');
         sp.style.setProperty('-webkit-text-fill-color', hex, 'important');
@@ -906,7 +1036,14 @@
         mes.dataset.yyxRev = rev;
         mes.dataset.yyxSig = structSig();
         const mt = mes.querySelector('.mes_text');
-        if (mt) MES_SIG.set(mes, textSig(mt));
+        if (mt) {
+            MES_SIG.set(mes, textSig(mt));
+            // 同步守护的基线：此刻的字符数与 span 数，之后任一变大/变小就说明需要补染
+            PAINT_CACHE.set(mes, {
+                total: (mt.textContent || '').length,
+                spans: mes.querySelectorAll('[data-yyx="ch"], [data-yyx="sol"]').length,
+            });
+        }
     }
 
     // 结构签名：只包含「决定 span 怎么排布」的项（模式 / 色标 / 角度）。
@@ -928,6 +1065,11 @@
         const groups = new Map();
         const sps = mes.querySelectorAll('[data-yyx="ch"]');
         if (!sps.length) return;
+        // 流式期间整组刷新节流（新字不受影响，见 applySpan）
+        const now = Date.now();
+        const lastFin = LAST_FINALIZE.get(mes) || 0;
+        applyOnlyNew = !forceFullFinalize && streaming && (now - lastFin) < STREAM_FINALIZE_GAP;
+        if (!applyOnlyNew) LAST_FINALIZE.set(mes, now);
         for (const sp of sps) {
             const kind = sp.getAttribute('data-k') || 'main';
             const cfgKey = kind === 'em' ? 'italic' : kind === 'quote' ? 'quote' : 'main';
@@ -948,7 +1090,8 @@
             }
             item.spans.push(sp);
         }
-        finalizeGroups(groups);
+        try { finalizeGroups(groups); }
+        finally { applyOnlyNew = false; }
     }
 
     // 只补新增文字 + 原地重上色：不动已有 span，因此流式期间不会出现「没光晕的那一帧」。
@@ -1190,13 +1333,43 @@
                 maxPaintMs: flicker.maxMs,
                 reasons: flicker.reason,
             },
-            lastMes: last ? {
-                done: last.dataset.yyx === '1',
-                stream: last.hasAttribute('data-yyx-stream'),
-                chars: ((last.querySelector('.mes_text') || {}).textContent || '').length,
-                spans: last.querySelectorAll('[data-yyx="ch"], [data-yyx="sol"]').length,
-                syncLimit: SYNC_PAINT_MAX_CHARS,
-            } : null,
+            lastMes: last ? (() => {
+                const mt = last.querySelector('.mes_text');
+                const sp = last.querySelector('[data-yyx="ch"]');
+                const cache = PAINT_CACHE.get(last);
+                const total = (mt ? mt.textContent : '').length;
+                const spans = last.querySelectorAll('[data-yyx="ch"], [data-yyx="sol"]').length;
+                return {
+                    done: last.dataset.yyx === '1',
+                    stream: last.hasAttribute('data-yyx-stream'),
+                    chars: total,
+                    spans,
+                    // 与上次染完时的基线对比：total > base.total 或 spans < base.spans 就代表「有新文字没染上」
+                    baseTotal: cache ? cache.total : null,
+                    baseSpans: cache ? cache.spans : null,
+                    lagChars: cache ? total - cache.total : null,
+                    // 真正生效的光晕（不是我们写进去的字符串）：none 就说明这一帧肉眼看不到光
+                    glowNow: sp ? (computedOf(sp, 'text-shadow') || 'none') : null,
+                    syncLimit: SYNC_PAINT_MAX_CHARS,
+                };
+            })() : null,
+            // 观察器健康度：容器是否被酒馆重建、观察器是否还挂在活节点上
+            observers: {
+                moTargetAlive: !!(chat.el && chat.el.isConnected),
+                moTargetIsCurrentChat: !!chat.el && chat.el === document.getElementById('chat'),
+                moAttached: !!chat.mo,
+                ioAttached: !!chat.io,
+            },
+            // 同步守护：流式期间每帧自检的成果（fixes > 0 说明观察器/事件漏了、被守护补上）
+            guard: {
+                frames: guard.frames,
+                fixes: guard.fixes,
+                lastFixAt: guard.lastFixAt,
+                lastFixChars: guard.lastFixChars,
+            },
+            mutations: mutCount,
+            lastMutationAt: lastMutAt,
+            timeline: timeline.slice(),
             now: snapshotState().items,
             afterEnd: endSnapshots,
             messages,
@@ -1279,6 +1452,9 @@
             }
         }
         if (!targets.size) return;
+        mutCount++;
+        lastMutAt = Date.now();
+        note('mut', targets.size);
         const deferred = [];
         for (const m of targets) {
             const mt = m.querySelector('.mes_text');
@@ -1326,6 +1502,7 @@
             if (incremental && m.dataset.yyx === '1') paintChars(m);
             else paintStreamChunk(m);
             flicker.sync++;
+            note('sync', incremental ? 'inc' : 'full');
         } catch (e) {
             console.warn(TAG, 'sync paint failed', e);
             flicker.fail++;
@@ -1353,9 +1530,23 @@
     function ensureObservers() {
         const c = chat.el;
         if (!c) return;
+        // 容器换了（重启/切聊天后酒馆重建 #chat）：旧观察器绑在已废弃节点上，必须重挂
+        if (chat.mo && chat.moTarget && chat.moTarget !== c) {
+            try { chat.mo.disconnect(); } catch { /* 忽略 */ }
+            chat.mo = null;
+            chat.moTarget = null;
+        }
+        if (chat.io && chat.ioTarget && chat.ioTarget !== c) {
+            try { chat.io.disconnect(); } catch { /* 忽略 */ }
+            chat.io = null;
+            chat.ioTarget = null;
+        }
         if (!chat.mo) {
             chat.mo = new MutationObserver(onChatMutation);
-            chat.mo.observe(c, { childList: true, subtree: true });
+            // characterData 也必须在订阅范围内：酒馆流式有两种写法（整段重写 / 只改文本节点），
+            // 只订阅 childList 时，后者一个通知都收不到 → 表面上「染到一半就停住」。
+            chat.mo.observe(c, { childList: true, characterData: true, subtree: true });
+            chat.moTarget = c;
         }
         if (!chat.io && typeof IntersectionObserver !== 'undefined') {
             chat.io = new IntersectionObserver(entries => {
@@ -1369,6 +1560,7 @@
                     else maybeProcess(m);
                 }
             }, { root: c, rootMargin: '150% 0px 150% 0px' });
+            chat.ioTarget = c;
             for (const m of c.querySelectorAll('.mes')) observeMes(m);
         }
         if (!chat.ro) {
@@ -1391,6 +1583,8 @@
             streaming = true;
             flicker.reset();
             startProbe();
+            guard.frames = 0; guard.fixes = 0; guard.lastFixAt = 0;
+            startGuard();
             if (chat.el) chat.el.classList.add('yyx-streaming'); // 流式类：未染色消息立即命中元素级渐变兜底
             if (streamTimer) clearTimeout(streamTimer);
             streamTimer = setTimeout(() => {
@@ -1400,6 +1594,7 @@
         });
         const endStream = () => {
             streaming = false;
+            stopGuard();
             if (chat.el) chat.el.classList.remove('yyx-streaming');
             if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; }
             scheduleRepaint(16); // 尽快按真实位置精确校正；期间 CSS 近似兜底持续生效，无原生色窗口
@@ -1407,18 +1602,20 @@
             // 手机端布局更慢，延迟再重染两遍，避免这类消息停留在纯文本 + 弱兜底光。
             scheduleRepaint(350);
             scheduleRepaint(1200);
+            // 再做一次「只补缺的」快速修复：漏掉的引号/斜体段、被拦在视口边缘的消息都能补上
+            fastPaintBurst();
             recordEndSnapshots();
         };
         on('GENERATION_ENDED', endStream);
         on('GENERATION_STOPPED', endStream);
 
-        on('MESSAGE_RECEIVED', () => scheduleRepaint(600));
+        on('MESSAGE_RECEIVED', () => { scheduleRepaint(600); repairVisible('recv'); });
         on('MESSAGE_SENT', () => scheduleRepaint(600));
         on('MESSAGE_EDITED', () => scheduleRepaint(300));
         on('MESSAGE_SWIPED', () => scheduleRepaint(300));
         on('MESSAGE_DELETED', () => scheduleRepaint(300));
-        on('CHAT_CHANGED', () => scheduleRepaint(500));
-        on('APP_READY', () => scheduleRepaint(300));
+        on('CHAT_CHANGED', () => { scheduleRepaint(500); fastPaintBurst(); });
+        on('APP_READY', () => { scheduleRepaint(300); fastPaintBurst(); });
     }
 
     // ===== 设置面板：取色器（参考图 2：色板 + 色相条 + Hex/RGB） =====
@@ -1763,6 +1960,7 @@
         const c = chat.el || document.getElementById('chat');
         if (!c) return;
         applying = true;
+        forceFullFinalize = true;
         try {
             for (const m of c.querySelectorAll('.mes[data-yyx="1"]')) {
                 if (!m.querySelector('[data-yyx="ch"], [data-yyx="sol"]')) {
@@ -1778,6 +1976,7 @@
             }
         } finally {
             applying = false;
+            forceFullFinalize = false;
         }
     }
 
@@ -1899,7 +2098,10 @@
                 chat.el = c;
                 clearAllSpans();
                 ensureObservers();
-                scheduleRepaint(50);
+                // 直接连打几枪同步修复，而不是只排一个 50ms 的防抖：
+                // 单一防抖如果撞上「消息还没布局（宽高为 0 被跳过）」，就会退化成
+                // 「先看到渐变、过几秒才冒出光晕」的两段式观感。
+                fastPaintBurst();
                 return;
             }
             if (++tries > 200) clearInterval(t);
@@ -1956,8 +2158,12 @@
                 if (colorCssTimer) { clearTimeout(colorCssTimer); colorCssTimer = null; }
                 if (restyleTimer) { clearTimeout(restyleTimer); restyleTimer = null; }
                 if (flicker.raf && typeof cancelAnimationFrame === 'function') { cancelAnimationFrame(flicker.raf); flicker.raf = null; }
+                stopGuard();
+                while (burstTimers.length) { clearTimeout(burstTimers.pop()); }
                 while (snapTimers.length) { clearTimeout(snapTimers.pop()); }
             },
+            _repairVisibleForTest: (tag) => repairVisible(tag),
+            _mesNeedsPaintForTest: (m) => mesNeedsPaint(m),
         };
     }
 
