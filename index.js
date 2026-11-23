@@ -1,5 +1,5 @@
 /*!
- * 聊天文字调色 v1.2.6
+ * 聊天文字调色 v1.2.7
  * SillyTavern UI 扩展
  *
  * 功能：
@@ -24,7 +24,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.2.6';
+    const VERSION = '1.2.7';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -1614,8 +1614,8 @@
                 continue;
             }
             observeMes(m);
-            // v1.2.6：已锁定的消息在生成结束前不再接受任何染色（它已经是元素级兜底），
-            // 这是「不闪」的结构性保证 —— 中途升级成逐字 span 再被下一个 chunk 打回，就是闪烁。
+            // v1.2.7：已锁定的消息（同步重建连续失败的兜底）在生成结束前不再重试，
+            // 保持元素级渐变 + 光晕，避免反复失败把界面拖住。
             if (streaming && isLocked(m)) { lock.skips++; continue; }
             // 结构还在（span 未被抹掉，只是文字增加了）：保留标记，走增量，已有 span 原地复用。
             // 增量补染只花 2~3ms（实测），继续保留。
@@ -1628,10 +1628,11 @@
             delete m.dataset.yyx;
             delete m.dataset.yyxRev;
             if (streaming) {
-                // 正文被整段重写：立刻锁定为「元素级渐变 + 光晕」这一种呈现，并持续到生成结束。
-                // 不再同步重建（实测整条重建 197~486ms，每次都让画面掉一次档 = 长消息闪烁）。
-                // 结束（GENERATION_ENDED / STOPPED）时统一解锁并做唯一一次精确逐字重建。
-                lockTarget(m);
+                // v1.2.7 关键：流式期间仍然逐字染色，且**在 MutationObserver 回调里同步做完**。
+                // MO 回调是微任务，发生在浏览器下一次绘制之前，所以不存在「先看到元素级兜底、
+                // 再跳成逐字色」的中间帧 —— 这也是「首色光晕 ↔ 每字同色光晕」交替闪烁的唯一来源。
+                // 只有连续失败（见 paintNow 的 catch）才退回元素级兜底并锁定到生成结束。
+                paintNow(m, false);
                 continue;
             }
             deferred.push(m);
@@ -1639,20 +1640,25 @@
         if (deferred.length) scheduleMes(deferred);
     }
 
-    // 同步重染：出错绝不能把异常抛回 MutationObserver（会让后续 chunk 全部丢失），一律吞掉并退回防抖路径。
+    // 同步重染：出错绝不能把异常抛回 MutationObserver（会让后续 chunk 全部丢失），
+    // 一律吞掉并退回防抖路径；同一条消息连续失败 3 次就锁定为元素级兜底，避免一直空转把界面拖住。
+    const FAILS = new WeakMap();
     function paintNow(m, incremental) {
         applying = true;
         const t0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
         try {
             if (incremental && m.dataset.yyx === '1') paintChars(m);
             else paintStreamChunk(m);
+            FAILS.delete(m);
             flicker.sync++;
             note('sync', incremental ? 'inc' : 'full');
         } catch (e) {
             console.warn(TAG, 'sync paint failed', e);
             flicker.fail++;
-            m.setAttribute('data-yyx-stream', '1');
-            scheduleMes([m]);
+            const n = (FAILS.get(m) || 0) + 1;
+            FAILS.set(m, n);
+            if (n >= 3) lockTarget(m); // 多次失败：本轮生成期间改用元素级兜底
+            else scheduleMes([m]);
         } finally {
             const dt = ((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - t0;
             flicker.lastMs = Math.round(dt);
