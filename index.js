@@ -23,7 +23,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.2.0';
+    const VERSION = '1.2.1';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -848,10 +848,21 @@
         }
     }
 
+    const MES_SIG = new WeakMap();   // 消息上次染完时的纯文本指纹（用于忽略自己写入产生的 DOM 回声）
+
+    function textSig(mt) {
+        const s = (mt && mt.textContent) || '';
+        let h = 0;
+        for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+        return s.length + ':' + h;
+    }
+
     function markDone(mes) {
         mes.dataset.yyx = '1';
         mes.dataset.yyxRev = rev;
         mes.dataset.yyxSig = structSig();
+        const mt = mes.querySelector('.mes_text');
+        if (mt) MES_SIG.set(mes, textSig(mt));
     }
 
     // 结构签名：只包含「决定 span 怎么排布」的项（模式 / 色标 / 角度）。
@@ -1198,15 +1209,65 @@
             }
         }
         if (!targets.size) return;
+        const deferred = [];
         for (const m of targets) {
+            const mt = m.querySelector('.mes_text');
+            const hasSpans = !!m.querySelector('[data-yyx="ch"], [data-yyx="sol"]');
+            // 自己写 DOM 也会触发回调（引用段落的叙述文字会插回纯文本节点），
+            // 这类回声必须忽略，否则会「重染 → 又触发 → 再重染」无限循环。
+            // 判据：消息里仍有我们的 span，且文本指纹和上次染完时一致。
+            if (hasSpans && mt && MES_SIG.get(m) === textSig(mt)) {
+                observeMes(m);
+                continue;
+            }
+            observeMes(m);
+            // 结构还在（span 未被抹掉，只是文字增加了）：保留标记，走增量，已有 span 原地复用。
+            if (hasSpans && streaming && syncPaintable(m)) {
+                paintNow(m, true);
+                continue;
+            }
             // 酒馆/外部改动了消息 DOM（流式重建、编辑、swipe、删除重插等）会抹掉逐字 span，
             // 清除「已处理」标记，强制重新染色，避免 maybeProcess 误判跳过而落回酒馆原生色。
             delete m.dataset.yyx;
             delete m.dataset.yyxRev;
+            // 关键：MutationObserver 回调在浏览器绘制之前执行，
+            // 这里同步重染，可以让这一帧直接是「逐字上色 + 逐字光晕」，
+            // 不会先露出一帧「无 span」的中间态（那正是流式闪烁的来源）。
+            // 代价是每个 chunk 有一次同步重排，长消息超过阈值时退回防抖，避免手机端卡顿。
+            if (streaming && syncPaintable(m)) {
+                paintNow(m, false);
+                continue;
+            }
             if (streaming) m.setAttribute('data-yyx-stream', '1');
-            observeMes(m);
+            deferred.push(m);
         }
-        scheduleMes([...targets]);
+        if (deferred.length) scheduleMes(deferred);
+    }
+
+    // 同步重染：出错绝不能把异常抛回 MutationObserver（会让后续 chunk 全部丢失），一律吞掉并退回防抖路径。
+    function paintNow(m, incremental) {
+        applying = true;
+        try {
+            if (incremental && m.dataset.yyx === '1') paintChars(m);
+            else paintStreamChunk(m);
+        } catch (e) {
+            console.warn(TAG, 'sync paint failed', e);
+            m.setAttribute('data-yyx-stream', '1');
+            scheduleMes([m]);
+        } finally {
+            applying = false;
+        }
+    }
+
+    // 同步重染的开销与字符数成正比，超长消息在手机端逐 chunk 同步重排会卡；
+    // 这里给一个上限，超出就退回 60ms 防抖（这类消息通常是历史长文，不是正在流出的新消息）。
+    const SYNC_PAINT_MAX_CHARS = 2200;
+    function syncPaintable(m) {
+        if (!m || !m.isConnected) return false;
+        const mt = m.querySelector('.mes_text');
+        if (!mt) return false;
+        const len = (mt.textContent || '').length;
+        return len <= SYNC_PAINT_MAX_CHARS;
     }
 
     function ensureObservers() {
