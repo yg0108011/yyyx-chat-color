@@ -1,5 +1,5 @@
 /*!
- * 聊天文字调色 v1.1.23
+ * 聊天文字调色 v1.1.24
  * SillyTavern UI 扩展
  *
  * 功能：
@@ -23,7 +23,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.1.23';
+    const VERSION = '1.1.24';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -905,8 +905,70 @@
         }
     }
 
-    // 诊断信息：挂到 window.__yyyx.debug()，便于在真机 F12 排查「结束后无光」。
-    // 只读当前设置、消息标签命中、逐字 span 数与内联 shadow、两张配色表规则，不改动 DOM。
+    // 诊断用：读取浏览器「真实生效」的样式值（不是我们写进 CSS 的字符串），
+    // 才能区分「规则没写对」和「写了但被主题覆盖/渲染不出来」。
+    function computedOf(el, prop) {
+        if (!el) return null;
+        try {
+            const cs = getComputedStyle(el);
+            return cs.getPropertyValue(prop) || null;
+        } catch { return null; }
+    }
+
+    // 某一时刻的状态快照：设置、消息标签命中、逐字 span、计算后的 filter/shadow。
+    function snapshotState() {
+        const c = document.getElementById('chat');
+        const items = [...document.querySelectorAll('#chat .mes')].slice(0, 2).map((m, i) => {
+            const mt = m.querySelector('.mes_text');
+            const q = mt ? mt.querySelector('q, blockquote') : null;
+            const em = mt ? mt.querySelector('em, i') : null;
+            const sp = m.querySelector('[data-yyx="ch"]');
+            const r = mt && mt.getBoundingClientRect ? mt.getBoundingClientRect() : null;
+            return {
+                i,
+                done: m.dataset.yyx === '1',
+                stream: m.hasAttribute('data-yyx-stream'),
+                w: r ? Math.round(r.width) : null,
+                h: r ? Math.round(r.height) : null,
+                emTag: em ? em.tagName.toLowerCase() : null,
+                emSpans: em ? em.querySelectorAll('[data-yyx="ch"]').length : 0,
+                emFilter: computedOf(em, 'filter'),
+                emShadow: computedOf(em, 'text-shadow'),
+                emFill: computedOf(em, '-webkit-text-fill-color'),
+                qSpans: q ? q.querySelectorAll('[data-yyx="ch"]').length : 0,
+                qFilter: computedOf(q, 'filter'),
+                qShadow: computedOf(q, 'text-shadow'),
+                qFill: computedOf(q, '-webkit-text-fill-color'),
+                spanShadow: computedOf(sp, 'text-shadow'),
+                spanFill: computedOf(sp, '-webkit-text-fill-color'),
+            };
+        });
+        return {
+            at: new Date().toISOString(),
+            streaming,
+            chatClass: c ? c.className : null,
+            enabled: settings.enabled !== false,
+            strength: { italic: settings.italic && settings.italic.strength, quote: settings.quote && settings.quote.strength },
+            glow: { italic: !!(settings.italic && settings.italic.glow), quote: !!(settings.quote && settings.quote.glow) },
+            items,
+        };
+    }
+
+    // 生成结束后的自动快照：400ms / 1400ms 各拍一次，抓住收尾瞬间的真实状态，
+    // 用户之后按「诊断信息」也能看到当时的样子，不必卡时间点。
+    const endSnapshots = [];
+    const snapTimers = [];
+    function recordEndSnapshots() {
+        for (const ms of [400, 1400]) {
+            const t = setTimeout(() => {
+                try { endSnapshots.push(snapshotState()); } catch { /* 忽略 */ }
+                if (endSnapshots.length > 4) endSnapshots.splice(0, endSnapshots.length - 4);
+            }, ms);
+            snapTimers.push(t);
+        }
+    }
+
+    // 诊断信息：挂到 window.__yyyx.debug()，面板「诊断信息」按钮也读同一份数据。
     function debugInfo() {
         const pick = (els) => [...els].slice(0, 2).map((el) => {
             const ch = el.querySelector('[data-yyx="ch"]');
@@ -918,18 +980,24 @@
                 text: el.textContent.slice(0, 24),
             };
         });
-        const messages = [...document.querySelectorAll('#chat .mes')].slice(0, 5).map((m, i) => ({
+        const messages = [...document.querySelectorAll('#chat .mes')].slice(0, 4).map((m, i) => ({
             i,
             done: m.dataset.yyx === '1',
             stream: m.hasAttribute('data-yyx-stream'),
             em: pick(m.querySelectorAll('em, i')),
             quote: pick(m.querySelectorAll('q, blockquote')),
         }));
-        const table = (id) => { const t = document.getElementById(id); return t ? t.textContent.slice(0, 500) : null; };
+        const table = (id) => { const t = document.getElementById(id); return t ? t.textContent.slice(0, 300) : null; };
+        const c = document.getElementById('chat');
         return {
             version: VERSION,
             streaming,
+            enabled: settings.enabled !== false,
+            chatClass: c ? c.className : null,
+            chatFound: !!c,
             settings: TARGET_KEYS.reduce((o, k) => { o[k] = settings[k]; return o; }, {}),
+            now: snapshotState().items,
+            afterEnd: endSnapshots,
             messages,
             colorCss: table('yyyx-color'),
             streamCss: table('yyyx-stream'),
@@ -1069,9 +1137,11 @@
             if (chat.el) chat.el.classList.remove('yyx-streaming');
             if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; }
             scheduleRepaint(16); // 尽快按真实位置精确校正；期间 CSS 近似兜底持续生效，无原生色窗口
-            // 二次补染：首帧 16ms 时刚收尾的消息布局可能尚未就绪（宽高为 0 被跳过），
-            // 延迟到布局稳定后再重染一遍，避免这类消息停留在纯文本 + 弱兜底光、看起来「结束就无光」。
+            // 二次、三次补染：首帧 16ms 时刚收尾的消息布局可能尚未就绪（宽高为 0 被跳过），
+            // 手机端布局更慢，延迟再重染两遍，避免这类消息停留在纯文本 + 弱兜底光。
             scheduleRepaint(350);
+            scheduleRepaint(1200);
+            recordEndSnapshots();
         };
         on('GENERATION_ENDED', endStream);
         on('GENERATION_STOPPED', endStream);
@@ -1545,7 +1615,7 @@
             gradientTextCss, glowFilter, targetDecl, buildColorCss, clearAllSpans,
             hexToRgb, rgbToHex, normHex, rgbToHsv, hsvToRgb, hexToHsv, hsvToHex,
             collectText, applyMes, restoreMes, finalizeGroups, applyGradientStyle, paintStreamChunk, repaintAll,
-            onChange, updateColorCss, reloadColorCss, scheduleColorReload, buildStreamCss, buildColorCss, debugInfo,
+            onChange, updateColorCss, reloadColorCss, scheduleColorReload, buildStreamCss, buildColorCss, debugInfo, snapshotState,
             _setSettingsForTest: (s) => { settings = s; rev = JSON.stringify(settings); },
             _getSettingsForTest: () => settings,
             _setStreamingForTest: (v) => { streaming = v; },
@@ -1557,6 +1627,7 @@
                 if (paintTimer) { clearTimeout(paintTimer); paintTimer = null; }
                 if (repaintTimer) { clearTimeout(repaintTimer); repaintTimer = null; }
                 if (colorCssTimer) { clearTimeout(colorCssTimer); colorCssTimer = null; }
+                while (snapTimers.length) { clearTimeout(snapTimers.pop()); }
             },
         };
     }
