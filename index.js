@@ -24,7 +24,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.2.7';
+    const VERSION = '1.2.8';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -85,6 +85,11 @@
         layer2: [{ radius: 2, alpha: 1.00 }, { radius: 10, alpha: 0.72 }],
         layer1: [{ radius: 6, alpha: 0.85 }],
     };
+
+    // 引号对 / 斜体对这类「按字符顺序线性取色」的单元，末端固定保留多少个字落在尾色上。
+    // 长短单元（一百多字的对话 vs 三四十字的斜体）结尾因此会是同一个蓝，而不是「长的那个
+    // 一路白、最后两个字才刚发蓝」。（上限 18% 保证短单元不会被压成一整条纯色。）
+    const ORDER_END_HOLD = 8;
 
     // ===== 颜色工具 =====
     function hexToRgb(hex) {
@@ -1011,19 +1016,14 @@
     // 若每次都全量写 DOM，手机端会明显抖动；这里只写「颜色真的变了」的那几个字。
     const SPAN_CACHE = new WeakMap();
 
-    // 流式期间的「整组重算」节流：长引用/长斜体每来一个 chunk 都要把所有已染色字的色值重算一遍，
-    // 手机端会产生每帧上千次样式写入（表现为密集的小幅重绘，看起来就像在闪）。
-    // 这里在流式期间最多每 STREAM_FINALIZE_GAP 毫秒整组刷新一次；新字（没有缓存）始终立即上色。
-    const STREAM_FINALIZE_GAP = 200;
-    const LAST_FINALIZE = new WeakMap();
-    let applyOnlyNew = false;
-    let forceFullFinalize = false;
-
+    // v1.2.8：取消「整组重算节流」。
+    // 旧做法是流式期间 200ms 内只给新字上色、老字保持旧值；但单元的字符数在流式期间一直在变长，
+    // 旧值是按「当时更短的单元」算出来的取色位置 —— 长引用因此会出现「中间比末尾更蓝」的非单调配色，
+    // 看起来就像两段不一样蓝。现在每个 chunk 都整条重算，配色始终单调、首尾固定。
     function applySpan(sp, hex, strength) {
         const prev = SPAN_CACHE.get(sp);
         const key = hex + '|' + strength + '|' + glowMode;
-        // 节流窗口内：已上过色的字保持原样，只保证「还没有颜色」的新字立刻上色
-        if (prev && (prev.k === key || applyOnlyNew)) return;
+        if (prev && prev.k === key) return;
         SPAN_CACHE.set(sp, { k: key });
         sp.style.setProperty('color', hex, 'important');
         sp.style.setProperty('-webkit-text-fill-color', hex, 'important');
@@ -1049,9 +1049,17 @@
                     ? Math.max(0, Math.min(1, (Number(cfg.strength) || 0) / 100))
                     : 0;
                 if (item.order) {
-                    // 每个引号内对话独立循环：按字符顺序线性取色（首→尾），不走空间投影，避免跨行方向反转
+                    // 每个引号内对话 / 每对 *xxx* 独立循环：按字符顺序线性取色（首→尾），
+                    // 不走空间投影，避免跨行方向反转。
+                    // v1.2.8：末端「保色」—— 无论单元多长，最后若干字都落在尾色上。
+                    // 之前纯线性时，100 多字的引号只有最后 1~2 个字真的到 #a8d8ff，肉眼看到的
+                    // 是「一路白到结尾」，而几十字的斜体最后 8 个字都是蓝的 —— 同一条消息里
+                    // 两种「蓝」看起来就不一样。这里把最后一小段压成尾色，让长短单元结尾同色。
+                    const hold = Math.min(0.18, ORDER_END_HOLD / n);
+                    const denom = 1 - hold;
                     for (let i = 0; i < n; i++) {
-                        const T = (n === 1) ? 0 : i / (n - 1);
+                        const t = (n === 1) ? 0 : i / (n - 1);
+                        const T = denom > 1e-6 ? Math.min(1, t / denom) : t;
                         applySpan(spans[i], colorAt(stops, T), strength);
                     }
                     continue;
@@ -1143,11 +1151,6 @@
         const groups = new Map();
         const sps = mes.querySelectorAll('[data-yyx="ch"]');
         if (!sps.length) return;
-        // 流式期间整组刷新节流（新字不受影响，见 applySpan）
-        const now = Date.now();
-        const lastFin = LAST_FINALIZE.get(mes) || 0;
-        applyOnlyNew = !forceFullFinalize && streaming && (now - lastFin) < STREAM_FINALIZE_GAP;
-        if (!applyOnlyNew) LAST_FINALIZE.set(mes, now);
         for (const sp of sps) {
             const kind = sp.getAttribute('data-k') || 'main';
             const cfgKey = kind === 'em' ? 'italic' : kind === 'quote' ? 'quote' : 'main';
@@ -1168,8 +1171,7 @@
             }
             item.spans.push(sp);
         }
-        try { finalizeGroups(groups); }
-        finally { applyOnlyNew = false; }
+        try { finalizeGroups(groups); } catch (e) { console.warn(TAG, 'finalize failed', e); }
     }
 
     // ===== 绘制耗时统计（诊断用：区分「JS 补染太慢」和「光栅化太慢」） =====
@@ -2130,7 +2132,6 @@
         const c = chat.el || document.getElementById('chat');
         if (!c) return;
         applying = true;
-        forceFullFinalize = true;
         try {
             for (const m of c.querySelectorAll('.mes[data-yyx="1"]')) {
                 if (!m.querySelector('[data-yyx="ch"], [data-yyx="sol"]')) {
@@ -2146,7 +2147,6 @@
             }
         } finally {
             applying = false;
-            forceFullFinalize = false;
         }
     }
 
