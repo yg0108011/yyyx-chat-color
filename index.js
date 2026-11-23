@@ -23,7 +23,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.2.3';
+    const VERSION = '1.2.4';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -76,6 +76,14 @@
         { radius: 8,  alpha: 0.85 },
         { radius: 24, alpha: 0.50 },
     ];
+    // 只发光一层/两层的轻量档：观感接近三层，但每个字少 1~2 次模糊光栅化。
+    // 手机上长消息（几千个发光字）会累积成很大的光栅化工作量，是"文字越长越闪"的可疑来源，
+    // 所以提供可切换的渲染档位，让真机可以直接验证是不是光晕成本导致的。
+    const GLOW_PRESETS = {
+        layer3: GLOW_LAYERS,
+        layer2: [{ radius: 2, alpha: 1.00 }, { radius: 10, alpha: 0.72 }],
+        layer1: [{ radius: 6, alpha: 0.85 }],
+    };
 
     // ===== 颜色工具 =====
     function hexToRgb(hex) {
@@ -157,16 +165,19 @@
         };
     }
 
-    // 逐字三层辉光：颜色 = 该字自身的颜色，强度 0~1 同时缩放半径与透明度
-    function glowShadow(hex, strength) {
+    // 逐字辉光：颜色 = 该字自身的颜色，强度 0~1 同时缩放半径与透明度
+    // mode: layer3（默认，三层）/ layer2 / layer1，由设置里的「光晕渲染」决定
+    function glowShadow(hex, strength, mode) {
         if (!(strength > 0)) return 'none';
         const s = Math.min(1, Math.max(0, Number(strength) || 0));
+        const m = GLOW_PRESETS[mode] ? mode : (GLOW_PRESETS[glowMode] ? glowMode : 'layer3');
+        const layers = GLOW_PRESETS[m];
         const [r, g, b] = hexToRgb(hex);
-        const key = `${r},${g},${b}|${Math.round(s * 100)}`;
+        const key = `${r},${g},${b}|${Math.round(s * 100)}|${m}`;
         let v = shadowCache.get(key);
         if (!v) {
             const ease = glowEase(s);
-            v = GLOW_LAYERS.map(L => {
+            v = layers.map(L => {
                 const rr = (L.radius * ease.r).toFixed(2);
                 const aa = (L.alpha * ease.a).toFixed(3);
                 return `0 0 ${rr}px rgba(${r},${g},${b},${aa})`;
@@ -175,6 +186,7 @@
         }
         return v;
     }
+    let glowMode = 'layer3';   // 运行时生效的光晕渲染档（来自 settings.glowMode）
 
     // 流式近似样式：某一类文字在流式期间的兜底颜色（渐变取中点色，纯色取纯色）
     function approxOf(cfg) {
@@ -395,6 +407,7 @@
 
     const DEFAULT_SETTINGS = {
         enabled: true,          // 插件总开关
+        glowMode: 'layer3',     // 光晕渲染档：layer3 / layer2 / layer1（轻量档用于排查长文闪烁）
         main: makeTargetDefaults(),
         italic: makeTargetDefaults(),
         quote: makeTargetDefaults(),
@@ -641,6 +654,7 @@
                 while (s[k].stops.length < MIN_STOPS) s[k].stops.push('#ffffff');
             }
             if (typeof s.enabled !== 'boolean') s.enabled = true;
+            if (!GLOW_PRESETS[s.glowMode]) s.glowMode = 'layer3';
             if (!Array.isArray(s.customPresets)) s.customPresets = [null, null, null];
             while (s.customPresets.length < 3) s.customPresets.push(null);
             s.customPresets = s.customPresets.slice(0, 3);
@@ -943,7 +957,7 @@
 
     function applySpan(sp, hex, strength) {
         const prev = SPAN_CACHE.get(sp);
-        const key = hex + '|' + strength;
+        const key = hex + '|' + strength + '|' + glowMode;
         // 节流窗口内：已上过色的字保持原样，只保证「还没有颜色」的新字立刻上色
         if (prev && (prev.k === key || applyOnlyNew)) return;
         SPAN_CACHE.set(sp, { k: key });
@@ -1094,8 +1108,28 @@
         finally { applyOnlyNew = false; }
     }
 
+    // ===== 绘制耗时统计（诊断用：区分「JS 补染太慢」和「光栅化太慢」） =====
+    const perf = { calls: 0, lastMs: 0, maxMs: 0, sumMs: 0, lastAt: 0, slowCount: 0, byKind: {} };
+    function timePaint(kind, fn) {
+        const t0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+        try {
+            return fn();
+        } finally {
+            const dt = ((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - t0;
+            perf.calls++;
+            perf.lastMs = Math.round(dt);
+            perf.sumMs += dt;
+            perf.lastAt = Date.now();
+            if (dt > perf.maxMs) perf.maxMs = Math.round(dt);
+            if (dt > 16) perf.slowCount++;
+            const b = perf.byKind[kind] || (perf.byKind[kind] = { n: 0, last: 0, max: 0 });
+            b.n++; b.last = Math.round(dt); if (dt > b.max) b.max = Math.round(dt);
+        }
+    }
+
     // 只补新增文字 + 原地重上色：不动已有 span，因此流式期间不会出现「没光晕的那一帧」。
-    function paintChars(mes) {
+    function paintChars(mes) { return timePaint('chars', () => _paintChars(mes)); }
+    function _paintChars(mes) {
         if (!mes || !mes.isConnected) return;
         if (settings.enabled === false) return;
         const mt = mes.querySelector('.mes_text');
@@ -1118,7 +1152,8 @@
         markDone(mes);
     }
 
-    function applyMes(mes) {
+    function applyMes(mes) { return timePaint('full', () => _applyMes(mes)); }
+    function _applyMes(mes) {
         // 先还原自身，保证 applyMes 可安全重复调用（否则消息自身的 data-yyx 会被 closest 命中而跳过全部文本）
         restoreMes(mes);
         const mt = mes.querySelector('.mes_text');
@@ -1174,7 +1209,6 @@
         }
         paintChars(mes);
     }
-
     // 重新渲染：已染色消息 + 视口附近的未染色消息
     function repaintAll() {
         const c = chat.el;
@@ -1369,6 +1403,34 @@
             },
             mutations: mutCount,
             lastMutationAt: lastMutAt,
+            // 绘制耗时：区分「JS 补染太慢」和「光栅化太慢（JS 很快但画面仍闪）」
+            perf: {
+                calls: perf.calls,
+                lastMs: perf.lastMs,
+                maxMs: perf.maxMs,
+                avgMs: perf.calls ? +(perf.sumMs / perf.calls).toFixed(1) : 0,
+                slowOver16ms: perf.slowCount,
+                byKind: perf.byKind,
+                lastAt: perf.lastAt,
+            },
+            // 发光成本：全场 span 数、带光晕的 span 数、模糊半径总和（判断是不是光栅化压力）
+            cost: (() => {
+                const sps = document.querySelectorAll('#chat .mes [data-yyx="ch"]');
+                let glowSpans = 0, blurSum = 0;
+                for (const sp of sps) {
+                    const sh = sp.style.textShadow || '';
+                    if (!sh || sh === 'none') continue;
+                    glowSpans++;
+                    for (const mm of sh.matchAll(/(\d+(?:\.\d+)?)px/g)) blurSum += parseFloat(mm[1]);
+                }
+                return {
+                    totalSpans: sps.length,
+                    glowSpans,
+                    blurSumPx: Math.round(blurSum),
+                    glowMode: glowMode,
+                    lastMesHeight: last ? Math.round(last.getBoundingClientRect().height) : null,
+                };
+            })(),
             timeline: timeline.slice(),
             now: snapshotState().items,
             afterEnd: endSnapshots,
@@ -1939,11 +2001,14 @@
     function onChange() {
         saveNow();
         const prevSig = lastSig;
+        const prevMode = glowMode;
+        glowMode = GLOW_PRESETS[settings.glowMode] ? settings.glowMode : 'layer3';
         rev = JSON.stringify(settings);
         const sig = structSig();
         lastSig = sig;
         updateStreamCss();
         updateColorCss(); // 元素级渐变/光晕规则随设置同步刷新（只是给未染色消息的过渡用）
+        if (prevMode !== glowMode) note('glow-mode', glowMode);
         if (sig !== prevSig) {
             // 模式 / 色标 / 角度变了：span 的分组结构必须重建，只能整条重来
             clearAllSpans();
@@ -2021,6 +2086,14 @@
           </div>
           <div class="inline-drawer-content yyx-panel">
             <div class="yyx-row"><label class="yyx-toggle"><input type="checkbox" class="yyx-enable" ${settings.enabled !== false ? 'checked' : ''}><span class="yyx-track"><span class="yyx-thumb"></span></span><span class="yyx-lbl">启用聊天文字调色（总开关）</span></label></div>
+            <div class="yyx-row">
+              <label class="yyx-lbl">光晕渲染</label>
+              <select class="yyx-in yyx-glowmode">
+                <option value="layer3">三层（默认，最亮）</option>
+                <option value="layer2">两层（省一点）</option>
+                <option value="layer1">一层（最省，长文最稳）</option>
+              </select>
+            </div>
             <div class="yyx-tabs" id="yyx-tabs"></div>
             <div id="yyx-tab-body"></div>
             <div class="yyx-sec">
@@ -2044,6 +2117,15 @@
         // 插件总开关
         $panel.find('.yyx-enable').on('change', function () {
             settings.enabled = !!this.checked;
+            onChange();
+        });
+
+        // 光晕渲染档位：三层/两层/一层。手机上长消息发光字太多时光栅化成本很高，
+        // 文字越长越容易出现闪动，切到省一点的档位可以直接验证这一点。
+        const $glowMode = $panel.find('.yyx-glowmode');
+        $glowMode.val(settings.glowMode || 'layer3');
+        $glowMode.on('change', function () {
+            settings.glowMode = this.value;
             onChange();
         });
 
