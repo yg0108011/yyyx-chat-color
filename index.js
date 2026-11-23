@@ -23,7 +23,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.2.4';
+    const VERSION = '1.2.5';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -238,8 +238,12 @@
         }
         const stops = stopsOf(cfg);
         const angle = Number.isFinite(Number(cfg.angle)) ? Number(cfg.angle) : 90;
-        const glow = strength100 > 0 ? glowFilter(stops, strength100) : 'none';
-        let d = `background:linear-gradient(${angle}deg,${stops.join(',')})!important;-webkit-background-clip:text!important;background-clip:text!important;color:transparent!important;-webkit-text-fill-color:transparent!important;text-shadow:none!important;filter:${glow}!important;`;
+        // v1.2.5：元素级兜底改用「text-shadow」发光，而不是 filter:drop-shadow。
+        // 真机证据表明手机端元素级 filter 完全不出光，而 span 上的 text-shadow 正常发光，
+        // 所以兜底也必须用 text-shadow，否则「重新染色这几百毫秒」就是一段没有光晕的黑洞，
+        // 长消息每次重建要 200~400ms，正好呈现为持续的一亮一暗。
+        const shadow = strength100 > 0 ? glowShadow(stops[0], strength) : 'none';
+        let d = `background:linear-gradient(${angle}deg,${stops.join(',')})!important;-webkit-background-clip:text!important;background-clip:text!important;color:transparent!important;-webkit-text-fill-color:transparent!important;text-shadow:${shadow}!important;filter:none!important;`;
         return d;
     }
 
@@ -274,8 +278,12 @@
         }
         const stops = stopsOf(cfg);
         const angle = Number.isFinite(Number(cfg.angle)) ? Number(cfg.angle) : 90;
-        const glow = cfg.glow ? glowFilter(stops, cfg.strength) : 'none';
-        return `background:linear-gradient(${angle}deg,${stops.join(',')})!important;-webkit-background-clip:text!important;background-clip:text!important;color:transparent!important;-webkit-text-fill-color:transparent!important;text-shadow:none!important;filter:${glow}!important;`;
+        // 同样改用 text-shadow（手机端 filter 不出光），兜底与逐字染色都用同一种发光机制。
+        // 颜色取色标首色而不是中点色：粉蓝这类「中间是白」的配色若用中点色发光，
+        // 会在暗底上糊成一片白雾，把渐变冲淡（这也是之前「流式偏灰白」的来源）。
+        const strength = cfg.glow ? Math.min(1, Math.max(0, (Number(cfg.strength) || 0) / 100)) : 0;
+        const shadow = strength > 0 ? glowShadow(stops[0], strength) : 'none';
+        return `background:linear-gradient(${angle}deg,${stops.join(',')})!important;-webkit-background-clip:text!important;background-clip:text!important;color:transparent!important;-webkit-text-fill-color:transparent!important;text-shadow:${shadow}!important;filter:none!important;`;
     }
 
     // 生成完整动态配色 CSS，只作用于「还没逐字染色」的消息（:not([data-yyx="1"])）。
@@ -526,6 +534,12 @@
         guard.raf = null;
         if (!streaming) return;
         guard.frames++;
+        // 流式期间正在密集吐字时不做整条重建（见 scheduleMes 的说明），只在静默后才补；
+        // 这样长消息不会每 0.6 秒卡两三百毫秒。逐字增量的情况在 MO 回调里已经处理。
+        if (Date.now() - lastMutAt < 900) {
+            guard.raf = requestAnimationFrame(guardTick);
+            return;
+        }
         const vh = window.innerHeight || 900;
         let fixed = 0;
         for (const m of tailMes(3)) {
@@ -558,6 +572,8 @@
     function repairVisible(tag) {
         const c = chatLive();
         if (!c || settings.enabled === false) return 0;
+        // 流式密集吐字期间不重建（会卡 200~400ms），静默后再补
+        if (streaming && Date.now() - lastMutAt < 900) return 0;
         const vh = window.innerHeight || 900;
         let fixed = 0;
         for (const m of tailMes(40)) {
@@ -1459,10 +1475,15 @@
 
     function scheduleMes(list, delay = 250) {
         for (const m of list) pendingMes.add(m);
-        // 流式期间必须跟上 chunk 节奏：延迟太长会先露出一段「还没逐字上色」的裸文本，
-        // 而明确要求的观感是从第一个字起就有渐变和光晕，所以这里压到 60ms。
-        if (streaming) delay = Math.min(delay, 60);
-        if (!paintTimer) paintTimer = setTimeout(flushPending, delay);
+        // v1.3.0：流式期间不再"每个 chunk 补染一次"。
+        // 真机实测一条 2500 字的消息整条重建要 200~426ms（perf.maxMs 426），
+        // 而酒馆每个 chunk 都会整段重写正文、把我们逐字 span 全部抹掉，
+        // 于是每 0.6 秒就要重建一次、每次卡住两三百毫秒 —— 期间画面掉回元素级兜底，
+        // 长消息就是持续的一亮一暗。现在改成：流式期间交给元素级兜底（已改为 text-shadow 发光，
+        // 外观与逐字版接近），只在「静默 1.2 秒」或生成结束时做一次精确重建。
+        if (streaming) delay = Math.max(delay, 1200);
+        if (paintTimer) { clearTimeout(paintTimer); paintTimer = null; }
+        paintTimer = setTimeout(flushPending, delay);
     }
 
     function scheduleRepaint(ms = 300) {
@@ -1530,6 +1551,7 @@
             }
             observeMes(m);
             // 结构还在（span 未被抹掉，只是文字增加了）：保留标记，走增量，已有 span 原地复用。
+            // 增量补染只花 2~3ms（实测），继续保留。
             if (hasSpans && streaming && syncPaintable(m)) {
                 paintNow(m, true);
                 continue;
@@ -1538,19 +1560,16 @@
             // 清除「已处理」标记，强制重新染色，避免 maybeProcess 误判跳过而落回酒馆原生色。
             delete m.dataset.yyx;
             delete m.dataset.yyxRev;
-            // 关键：MutationObserver 回调在浏览器绘制之前执行，
-            // 这里同步重染，可以让这一帧直接是「逐字上色 + 逐字光晕」，
-            // 不会先露出一帧「无 span」的中间态（那正是流式闪烁的来源）。
-            // 同步重染对长消息也是必须的：一旦退回防抖，中间几帧就只剩元素级 CSS，
-            // 而元素级路径在部分手机浏览器上根本不出光 → 有光/无光交替。
             if (streaming) {
-                if (syncPaintable(m)) {
-                    paintNow(m, false);
-                    continue;
-                }
-                flicker.deferred++; flicker.reason.tooLong = (flicker.reason.tooLong || 0) + 1;
+                // v1.3.0 关键改动：流式期间「整条重建」不再同步执行。
+                // 酒馆每个 chunk 都会整段重写正文、把 span 全抹掉，长消息整条重建要 200~426ms，
+                // 同步做就是每 0.6 秒卡一次、画面在「有光/无光」之间来回 —— 这正是长消息的闪烁。
+                // 现在立刻退回元素级兜底（已是渐变 + text-shadow 发光，肉眼与逐字版接近），
+                // 精确重建交给「静默 1.2 秒」或生成结束，最多只有一次、且在静止画面里完成。
+                m.setAttribute('data-yyx-stream', '1');
+                deferred.push(m);
+                continue;
             }
-            if (streaming) m.setAttribute('data-yyx-stream', '1');
             deferred.push(m);
         }
         if (deferred.length) scheduleMes(deferred);
