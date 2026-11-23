@@ -24,7 +24,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.2.9';
+    const VERSION = '1.2.10';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -195,7 +195,8 @@
         }
         return v;
     }
-    let glowMode = 'layer3';   // 运行时生效的光晕渲染档（来自 settings.glowMode）
+    // 光晕固定三层（面板不再提供档位切换；glowShadow 仍保留 mode 参数以便单测与后续复用）
+    const glowMode = 'layer3';
 
     // 流式近似样式：某一类文字在流式期间的兜底颜色（渐变取中点色，纯色取纯色）
     function approxOf(cfg) {
@@ -424,7 +425,6 @@
 
     const DEFAULT_SETTINGS = {
         enabled: true,          // 插件总开关
-        glowMode: 'layer3',     // 光晕渲染档：layer3 / layer2 / layer1（轻量档用于排查长文闪烁）
         main: makeTargetDefaults(),
         italic: makeTargetDefaults(),
         quote: makeTargetDefaults(),
@@ -726,7 +726,7 @@
                 while (s[k].stops.length < MIN_STOPS) s[k].stops.push('#ffffff');
             }
             if (typeof s.enabled !== 'boolean') s.enabled = true;
-            if (!GLOW_PRESETS[s.glowMode]) s.glowMode = 'layer3';
+            delete s.glowMode; // 光晕档位已从面板移除，旧存档里的字段一并清掉，统一按三层渲染
             if (!Array.isArray(s.customPresets)) s.customPresets = [null, null, null];
             while (s.customPresets.length < 3) s.customPresets.push(null);
             s.customPresets = s.customPresets.slice(0, 3);
@@ -2108,14 +2108,11 @@
     function onChange() {
         saveNow();
         const prevSig = lastSig;
-        const prevMode = glowMode;
-        glowMode = GLOW_PRESETS[settings.glowMode] ? settings.glowMode : 'layer3';
         rev = JSON.stringify(settings);
         const sig = structSig();
         lastSig = sig;
         updateStreamCss();
         updateColorCss(); // 元素级渐变/光晕规则随设置同步刷新（只是给未染色消息的过渡用）
-        if (prevMode !== glowMode) note('glow-mode', glowMode);
         if (sig !== prevSig) {
             // 模式 / 色标 / 角度变了：span 的分组结构必须重建，只能整条重来
             clearAllSpans();
@@ -2191,14 +2188,6 @@
           </div>
           <div class="inline-drawer-content yyx-panel">
             <div class="yyx-row"><label class="yyx-toggle"><input type="checkbox" class="yyx-enable" ${settings.enabled !== false ? 'checked' : ''}><span class="yyx-track"><span class="yyx-thumb"></span></span><span class="yyx-lbl">启用聊天文字调色（总开关）</span></label></div>
-            <div class="yyx-row">
-              <label class="yyx-lbl">光晕渲染</label>
-              <select class="yyx-in yyx-glowmode">
-                <option value="layer3">三层（默认，最亮）</option>
-                <option value="layer2">两层（省一点）</option>
-                <option value="layer1">一层（最省，长文最稳）</option>
-              </select>
-            </div>
             <div class="yyx-tabs" id="yyx-tabs"></div>
             <div id="yyx-tab-body"></div>
             <div class="yyx-sec">
@@ -2222,15 +2211,6 @@
         // 插件总开关
         $panel.find('.yyx-enable').on('change', function () {
             settings.enabled = !!this.checked;
-            onChange();
-        });
-
-        // 光晕渲染档位：三层/两层/一层。手机上长消息发光字太多时光栅化成本很高，
-        // 文字越长越容易出现闪动，切到省一点的档位可以直接验证这一点。
-        const $glowMode = $panel.find('.yyx-glowmode');
-        $glowMode.val(settings.glowMode || 'layer3');
-        $glowMode.on('change', function () {
-            settings.glowMode = this.value;
             onChange();
         });
 
