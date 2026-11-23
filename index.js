@@ -1,5 +1,5 @@
 /*!
- * 聊天文字调色 v1.1.20
+ * 聊天文字调色 v1.1.21
  * SillyTavern UI 扩展
  *
  * 功能：
@@ -23,7 +23,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.1.20';
+    const VERSION = '1.1.21';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -147,6 +147,16 @@
 
     const shadowCache = new Map();
 
+    // 强度 0~1 → 光晕半径/透明度缓动系数。
+    // 低段（拖弱光时）衰减放缓：半径走幂曲线保留扩散范围，透明度叠加下限保留可见辉光，
+    // 避免「稍微调低就完全看不见光晕」；满档 s=1 与无光 s=0 口径保持不变。
+    function glowEase(s) {
+        return {
+            r: Math.pow(s, 0.65),          // 半径：低段衰减慢于线性
+            a: 0.22 + 0.78 * s,            // 透明度：最低保留 22% 基准辉光
+        };
+    }
+
     // 逐字三层辉光：颜色 = 该字自身的颜色，强度 0~1 同时缩放半径与透明度
     function glowShadow(hex, strength) {
         if (!(strength > 0)) return 'none';
@@ -155,9 +165,10 @@
         const key = `${r},${g},${b}|${Math.round(s * 100)}`;
         let v = shadowCache.get(key);
         if (!v) {
+            const ease = glowEase(s);
             v = GLOW_LAYERS.map(L => {
-                const rr = (L.radius * s).toFixed(2);
-                const aa = (L.alpha * s).toFixed(3);
+                const rr = (L.radius * ease.r).toFixed(2);
+                const aa = (L.alpha * ease.a).toFixed(3);
                 return `0 0 ${rr}px rgba(${r},${g},${b},${aa})`;
             }).join(', ');
             shadowCache.set(key, v);
@@ -185,7 +196,7 @@
     }
 
     // 光晕：两层 drop-shadow 霓虹发光——内层取渐变首色（贴字亮边）、外层取渐变尾色（大范围扩散晕）。
-    // 半径/透明度随强度线性缩放，100% 时为强霓虹档（内层首色 3px/0.60、外层尾色 10px/0.45），
+    // 半径/透明度随强度经缓动缩放（低段保可见下限），100% 时为强霓虹档（内层首色 3px/0.60、外层尾色 10px/0.45），
     // 明显强于「雨夜回响」名字光晕（3px/0.45、8px/0.25），保证暗色尾色下光晕也清晰可见。
     function glowFilter(stops, strength) {
         const s = Math.min(1, Math.max(0, (Number(strength) || 0) / 100));
@@ -193,9 +204,10 @@
         const list = stopsOf({ stops });
         const first = hexToRgb(list[0]);
         const last = hexToRgb(list[list.length - 1]);
+        const ease = glowEase(s);
         return [
-            `drop-shadow(0 0 ${(3 * s).toFixed(2)}px rgba(${first[0]},${first[1]},${first[2]},${(0.60 * s).toFixed(3)}))`,
-            `drop-shadow(0 0 ${(10 * s).toFixed(2)}px rgba(${last[0]},${last[1]},${last[2]},${(0.45 * s).toFixed(3)}))`,
+            `drop-shadow(0 0 ${(3 * ease.r).toFixed(2)}px rgba(${first[0]},${first[1]},${first[2]},${(0.60 * ease.a).toFixed(3)}))`,
+            `drop-shadow(0 0 ${(10 * ease.r).toFixed(2)}px rgba(${last[0]},${last[1]},${last[2]},${(0.45 * ease.a).toFixed(3)}))`,
         ].join(' ');
     }
 
@@ -540,13 +552,27 @@
             document.head.appendChild(sc);
         }
         sc.textContent = buildStreamCss(settings);
+        // 元素级配色表（渐变背景裁剪 + drop-shadow 光晕）：启动即创建，
+        // 不依赖消息事件兜底才首次建表，避免首屏空窗。
+        let cc = document.getElementById('yyyx-color');
+        if (!cc) {
+            cc = document.createElement('style');
+            cc.id = 'yyyx-color';
+            document.head.appendChild(cc);
+        }
+        cc.textContent = buildColorCss(settings);
     }
 
-    // 设置变化时刷新动态配色样式
+    // 设置变化时刷新动态配色样式（表缺失则创建，避免面板改设置后元素级规则落空）
     function updateColorCss() {
         if (typeof document === 'undefined') return; // Node 纯函数测试环境
-        const sc = document.getElementById('yyyx-color');
-        if (sc) sc.textContent = buildColorCss(settings);
+        let sc = document.getElementById('yyyx-color');
+        if (!sc) {
+            sc = document.createElement('style');
+            sc.id = 'yyyx-color';
+            document.head.appendChild(sc);
+        }
+        sc.textContent = buildColorCss(settings);
     }
 
     // 设置变化时刷新流式兜底样式（逐字引擎运行时路径）
@@ -1342,6 +1368,7 @@
         saveNow();
         rev = JSON.stringify(settings);
         updateStreamCss();
+        updateColorCss(); // 元素级渐变/光晕规则随设置同步刷新（强度、颜色、角度、开关、模式）
         clearAllSpans();
         scheduleRepaint(150);
     }
@@ -1466,6 +1493,7 @@
             gradientTextCss, glowFilter, targetDecl, buildColorCss, clearAllSpans,
             hexToRgb, rgbToHex, normHex, rgbToHsv, hsvToRgb, hexToHsv, hsvToHex,
             collectText, applyMes, restoreMes, finalizeGroups, applyGradientStyle, paintStreamChunk, repaintAll,
+            onChange, updateColorCss,
             _setSettingsForTest: (s) => { settings = s; rev = JSON.stringify(settings); },
             _getSettingsForTest: () => settings,
             _setStreamingForTest: (v) => { streaming = v; },
