@@ -23,7 +23,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.1.24';
+    const VERSION = '1.2.0';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -231,19 +231,17 @@
         return d;
     }
 
-    // 生成流式兜底 CSS：流式期间让「尚未逐字染色的消息」立即呈现完整渐变 + 光晕。
-    // 双轨命中：
-    //  A. data-yyx-stream 逐消息标记（兼容旧路径）；
-    //  B. #chat.yyx-streaming——流式开始时给 #chat 加类，整页消息立刻命中元素级兜底。
-    //     不再用 :not([data-yyx="1"]) 排除：消息刚被酒馆重建的瞬间旧完成标记尚未被观察器清除，
-    //     若排除已处理消息会留下「主题色 → 渐变」的空窗造成闪烁；流式期间本就不跑逐字校正，
-    //     已染色消息的逐字 span 内联 important 样式优先于本样式表，不会被兜底覆盖。
-    // DOM 稳定后再精确逐字校正。
+    // 生成流式兜底 CSS：只给「还没逐字染色的那一瞬」用，一旦消息被逐字染上就立刻让位。
+    // 现在流式期间也走逐字染色（paintStreamChunk），这个兜底只是从「消息刚出现」到
+    // 「首次逐字命中（毫秒级）」之间的过渡，且被 :not([data-yyx="1"]) 严格互斥，
+    // 不会再和逐字 span 抢同一帧，因此不会出现「有光/无光」交替。
     function buildStreamCss(s) {
+        const A = '#chat .mes:not([data-yyx="1"])[data-yyx-stream] .mes_text';
+        const B = '#chat.yyx-streaming .mes:not([data-yyx="1"]) .mes_text';
         const rows = [
-            ['main', '#chat .mes[data-yyx-stream] .mes_text', '#chat.yyx-streaming .mes .mes_text'],
-            ['italic', '#chat .mes[data-yyx-stream] .mes_text em, #chat .mes[data-yyx-stream] .mes_text i', '#chat.yyx-streaming .mes .mes_text em, #chat.yyx-streaming .mes .mes_text i'],
-            ['quote', '#chat .mes[data-yyx-stream] .mes_text q, #chat .mes[data-yyx-stream] .mes_text blockquote', '#chat.yyx-streaming .mes .mes_text q, #chat.yyx-streaming .mes .mes_text blockquote'],
+            ['main', `${A}`, `${B}`],
+            ['italic', `${A} em, ${A} i`, `${B} em, ${B} i`],
+            ['quote', `${A} q, ${A} blockquote`, `${B} q, ${B} blockquote`],
         ];
         let css = '';
         for (const [k, selA, selB] of rows) {
@@ -268,13 +266,15 @@
         return `background:linear-gradient(${angle}deg,${stops.join(',')})!important;-webkit-background-clip:text!important;background-clip:text!important;color:transparent!important;-webkit-text-fill-color:transparent!important;text-shadow:none!important;filter:${glow}!important;`;
     }
 
-    // 生成完整动态配色 CSS：主要文本整条渐变，斜体按 em 段、引用按 q/blockquote 段渐变。
-    // 斜体与引用选择器特异性更高，自然覆盖主要文本；后声明者优先（斜体 > 引用 > 主要文本）。
+    // 生成完整动态配色 CSS，只作用于「还没逐字染色」的消息（:not([data-yyx="1"])）。
+    // 一旦消息被逐字染过，颜色与光晕就全部由每个 span 自己承担，元素级渐变/filter 一律让位，
+    // 避免两套发光机制在同一条消息上反复抢占（这是「一闪一闪」「调强度就掉光」的根源）。
     function buildColorCss(s) {
+        const NEUTRAL = `[data-yyx="1"]`;
         const sel = {
-            main: '#chat .mes .mes_text',
-            italic: '#chat .mes .mes_text em, #chat .mes .mes_text i',
-            quote: '#chat .mes .mes_text q, #chat .mes .mes_text blockquote',
+            main: `#chat .mes:not(${NEUTRAL}) .mes_text`,
+            italic: `#chat .mes:not(${NEUTRAL}) .mes_text em, #chat .mes:not(${NEUTRAL}) .mes_text i`,
+            quote: `#chat .mes:not(${NEUTRAL}) .mes_text q, #chat .mes:not(${NEUTRAL}) .mes_text blockquote`,
         };
         let css = '';
         for (const k of ['main', 'quote', 'italic']) {
@@ -290,6 +290,9 @@
         if (ic && ic.mode === 'gradient' && ic.glow) {
             css += `#chat .mes .mes_text em, #chat .mes .mes_text i{padding:0 3px!important}`;
         }
+        // 已逐字染色的消息：元素本身必须回到中性，否则祖先的 background-clip:text
+        // 会把子 span 的 text-shadow 一起裁掉（手机端表现为「有字无色光」）。
+        css += `#chat .mes[data-yyx="1"] .mes_text, #chat .mes[data-yyx="1"] .mes_text em, #chat .mes[data-yyx="1"] .mes_text i, #chat .mes[data-yyx="1"] .mes_text q, #chat .mes[data-yyx="1"] .mes_text blockquote{background:none!important;-webkit-background-clip:border-box!important;background-clip:border-box!important;-webkit-text-fill-color:currentColor!important;text-shadow:none!important;filter:none!important;color:inherit!important;}`;
         return css;
     }
 
@@ -408,6 +411,8 @@
     let paintTimer = null;
     let repaintTimer = null;
     let colorCssTimer = null;    // 配色 CSS 重载防抖计时器（消息 DOM 重建后兜底）
+    let restyleTimer = null;      // 原地重刷（改强度/光晕，不拆 span）
+    let lastSig = '';             // 上次的结构签名（模式/色标/角度），决定要不要重建 span
     let booted = false;
     let uiBuilt = false;
     let uiTimerId = null;
@@ -651,7 +656,10 @@
     }
 
     // ===== 染色引擎 =====
-    // 收集文本节点：跳过代码块、代码行内、已染色节点及额外排除的子树
+    // 收集文本节点：跳过代码块、代码行内、已染色的 span 及额外排除的子树。
+    // 注意只能排除 span 级的 data-yyx="ch"/"sol"，不能排除消息级的 data-yyx="1" ——
+    // 流式增量染色时消息已经带 data-yyx="1"，若用 [data-yyx] 匹配，closest 会一路命到
+    // .mes 自身，导致新文字一个都染不上（表现为「流式期间只有部分字有色」）。
     function collectText(root, extraSkip) {
         const out = [];
         const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
@@ -659,7 +667,7 @@
         while ((n = w.nextNode())) {
             const p = n.parentNode;
             if (!p) continue;
-            if (p.closest('code, pre, [data-yyx]')) continue;
+            if (p.closest('code, pre, [data-yyx="ch"], [data-yyx="sol"]')) continue;
             if (extraSkip && p.closest(extraSkip)) continue;
             out.push(n);
         }
@@ -677,6 +685,9 @@
         node.parentNode.replaceChild(sp, node);
     }
 
+    // 引用解析状态按元素保存：流式增量包裹时，后续文本节点要接着上一段引号状态继续。
+    const QSTATE = new WeakMap();
+
     function paintGradient(el, cfg, granularity, groups, extraSkip) {
         const stops = stopsOf(cfg);
         let container = el;
@@ -685,11 +696,13 @@
         }
         let key = groups.get(container);
         if (!key) { key = new Map(); groups.set(container, key); }
-        let gid = 0;
         const byQuote = granularity === 'quote';     // 引用：每对引号一个循环，叙述不染
         const byEm = granularity === 'em';           // 斜体：每对 * 包裹的 em 一个循环
         const byOrder = byQuote || byEm;             // 引号内 / 斜体按字符顺序线性取色
-        let qstate = null;                             // 引用引号状态跨文本节点延续
+        // 组号 / 引号状态从上次包裹处延续，保证流式增量追加时不会和已有分组串在一起
+        let gid = Number(el.dataset.yyxG || 0) || 0;
+        let qstate = byQuote ? (QSTATE.get(el) || null) : null;
+        const kindAttr = byQuote ? 'quote' : byEm ? 'em' : 'main';
         const getList = (g) => {
             let L = key.get(g);
             if (!L) { L = { spans: [], cfg, stops, order: byOrder }; key.set(g, L); }
@@ -713,6 +726,7 @@
                     const sp = document.createElement('span');
                     sp.className = 'yyx-ch';
                     sp.setAttribute('data-yyx', 'ch');
+                    sp.setAttribute('data-k', kindAttr);
                     sp.setAttribute('data-g', String(g));
                     sp.textContent = chars[i];
                     frag.appendChild(sp);
@@ -725,6 +739,7 @@
                     const sp = document.createElement('span');
                     sp.className = 'yyx-ch';
                     sp.setAttribute('data-yyx', 'ch');
+                    sp.setAttribute('data-k', kindAttr);
                     sp.setAttribute('data-g', String(gid));
                     sp.textContent = ch;
                     frag.appendChild(sp);
@@ -733,6 +748,8 @@
             }
             n.parentNode.replaceChild(frag, n);
         }
+        el.dataset.yyxG = String(gid);
+        if (byQuote) QSTATE.set(el, qstate);
     }
 
     function paintTargetEl(el, cfg, groups, granularity, extraSkip) {
@@ -745,6 +762,20 @@
             return;
         }
         paintGradient(el, cfg, granularity, groups, extraSkip);
+    }
+
+    // 每个 span 上一次写入的样式缓存：流式每来一个 chunk 都要重算整条消息的取色，
+    // 若每次都全量写 DOM，手机端会明显抖动；这里只写「颜色真的变了」的那几个字。
+    const SPAN_CACHE = new WeakMap();
+
+    function applySpan(sp, hex, strength) {
+        const prev = SPAN_CACHE.get(sp);
+        const key = hex + '|' + strength;
+        if (prev && prev.k === key) return;
+        SPAN_CACHE.set(sp, { k: key });
+        sp.style.setProperty('color', hex, 'important');
+        sp.style.setProperty('-webkit-text-fill-color', hex, 'important');
+        sp.style.setProperty('text-shadow', glowShadow(hex, strength), 'important');
     }
 
     // 依据字符在容器中的真实位置沿渐变方向投影取色（角度按 CSS 约定）
@@ -769,11 +800,7 @@
                     // 每个引号内对话独立循环：按字符顺序线性取色（首→尾），不走空间投影，避免跨行方向反转
                     for (let i = 0; i < n; i++) {
                         const T = (n === 1) ? 0 : i / (n - 1);
-                        const hex = colorAt(stops, T);
-                        const sp = spans[i];
-                        sp.style.setProperty('color', hex, 'important');
-                        sp.style.setProperty('-webkit-text-fill-color', hex, 'important');
-                        sp.style.setProperty('text-shadow', glowShadow(hex, strength), 'important');
+                        applySpan(spans[i], colorAt(stops, T), strength);
                     }
                     continue;
                 }
@@ -796,11 +823,7 @@
                     if (!hasBox) T = (n === 1) ? 0 : i / (n - 1);
                     else if (span2 < 1e-6) T = 0;
                     else T = Math.min(1, Math.max(0, (ts[i] - tmin) / span2));
-                    const hex = colorAt(stops, T);
-                    const sp = spans[i];
-                    sp.style.setProperty('color', hex, 'important');
-                    sp.style.setProperty('-webkit-text-fill-color', hex, 'important');
-                    sp.style.setProperty('text-shadow', glowShadow(hex, strength), 'important');
+                    applySpan(spans[i], colorAt(stops, T), strength);
                 }
             }
         }
@@ -818,11 +841,83 @@
         }
         delete mes.dataset.yyx;
         delete mes.dataset.yyxRev;
+        delete mes.dataset.yyxSig;
+        // 分组续接标记随文本一起作废，避免还原后再次包裹时沿用旧组号
+        for (const el of mes.querySelectorAll('.mes_text, .mes_text em, .mes_text i, .mes_text q, .mes_text blockquote')) {
+            delete el.dataset.yyxG;
+        }
     }
 
     function markDone(mes) {
         mes.dataset.yyx = '1';
         mes.dataset.yyxRev = rev;
+        mes.dataset.yyxSig = structSig();
+    }
+
+    // 结构签名：只包含「决定 span 怎么排布」的项（模式 / 色标 / 角度）。
+    // 强度、光晕开关、纯色只影响每个 span 的样式，不改变结构 —— 这类改动可以原地重刷，无需拆 span。
+    function structSig() {
+        return TARGET_KEYS.map((k) => {
+            const t = settings[k] || {};
+            const st = Array.isArray(t.stops) ? t.stops.join(',') : '';
+            return `${t.mode}|${t.color || ''}|${st}|${t.angle || 0}`;
+        }).join(';');
+    }
+
+    // 从 DOM 里现有的逐字 span 重建分组表，交给 finalizeGroups 重新上色。
+    // 用于「只改样式、不重建结构」的原地刷新（调强度 / 开关光晕 / 颜色），
+    // 这样光晕不会因为拆 span 而出现「消失一下再回来」的空窗。
+    function finalizeFromDom(mes) {
+        const mt = mes.querySelector('.mes_text');
+        if (!mt) return;
+        const groups = new Map();
+        const sps = mes.querySelectorAll('[data-yyx="ch"]');
+        if (!sps.length) return;
+        for (const sp of sps) {
+            const kind = sp.getAttribute('data-k') || 'main';
+            const cfgKey = kind === 'em' ? 'italic' : kind === 'quote' ? 'quote' : 'main';
+            const cfg = settings[cfgKey];
+            if (!cfg || cfg.mode === 'theme') continue;
+            // 容器必须和染色时一致：主要文本统一用 .mes_text（整条消息一个渐变），
+            // 斜体/引用用它自己那个 em / q。若这里按最近的 p 分组，正文会变成「每段一个完整渐变」。
+            const host = kind === 'main'
+                ? mt
+                : (sp.closest('em, i, q, blockquote') || mt);
+            let key = groups.get(host);
+            if (!key) { key = new Map(); groups.set(host, key); }
+            const g = sp.getAttribute('data-g') || '0';
+            let item = key.get(g);
+            if (!item) {
+                item = { spans: [], cfg, stops: stopsOf(cfg), order: kind !== 'main' };
+                key.set(g, item);
+            }
+            item.spans.push(sp);
+        }
+        finalizeGroups(groups);
+    }
+
+    // 只补新增文字 + 原地重上色：不动已有 span，因此流式期间不会出现「没光晕的那一帧」。
+    function paintChars(mes) {
+        if (!mes || !mes.isConnected) return;
+        if (settings.enabled === false) return;
+        const mt = mes.querySelector('.mes_text');
+        if (!mt) return;
+        const r = mt.getBoundingClientRect();
+        if (r.width === 0 && r.height === 0) return; // 无布局，等可见再染
+        const dummy = new Map();
+        const s = settings;
+        for (const em of mt.querySelectorAll('em, i')) {
+            if (em.closest('code, pre')) continue;
+            paintTargetEl(em, s.italic, dummy, 'em');
+        }
+        for (const q of mt.querySelectorAll('q, blockquote')) {
+            if (q.closest('code, pre')) continue;
+            paintTargetEl(q, s.quote, dummy, 'quote');
+        }
+        paintTargetEl(mt, s.main, dummy, 'message', 'em, i, q, blockquote');
+        finalizeFromDom(mes);
+        mes.removeAttribute('data-yyx-stream');
+        markDone(mes);
     }
 
     function applyMes(mes) {
@@ -843,7 +938,7 @@
         const s = settings;
         // 斜体优先（最内层），引用其次，主要文本最后
         for (const em of mt.querySelectorAll('em, i')) {
-            if (em.closest('code, pre, [data-yyx]')) continue;
+            if (em.closest('code, pre, [data-yyx="ch"], [data-yyx="sol"]')) continue;
             paintTargetEl(em, s.italic, groups, 'em');
         }
         for (const q of mt.querySelectorAll('q, blockquote')) {
@@ -852,34 +947,38 @@
         }
         paintTargetEl(mt, s.main, groups, 'message', 'em, i, q, blockquote');
         finalizeGroups(groups);
-        // 已成功逐字染色：移除残留的流式兜底标记，避免元素级兜底 CSS 继续覆盖逐字样式（编辑后变淡）
         mes.removeAttribute('data-yyx-stream');
         markDone(mes);
     }
 
     function maybeProcess(m) {
         if (!m || !m.isConnected) return;
-        if (m.dataset.yyx === '1' && m.dataset.yyxRev === rev) return;
+        if (m.dataset.yyx === '1' && m.dataset.yyxRev === rev && m.dataset.yyxSig === structSig()) return;
+        if (m.dataset.yyx === '1' && m.dataset.yyxSig === structSig()) {
+            // 结构没变、只是数值变了：原地重刷，不拆 span
+            paintChars(m);
+            return;
+        }
         restoreMes(m);
         applyMes(m);
     }
 
-    // 流式生成期间只打兜底标记：让元素级渐变 CSS（buildStreamCss）呈现完整渐变 + 光晕。
-    // 不再逐字 wrap——逐字增量把新增文字按「整条累计序号」映射成接近尾色，会冲掉完整渐变
-    // （流式期间首色/粉色缺失、颜色寡淡），且每 chunk 重建会反复 wrap 造成闪烁。
-    // 生成结束后 repaintAll 统一按真实位置逐字精确校正为每字同色光晕。
+    // 流式生成期间的染色：单一路径 —— 与结束后同一套逐字 span（每字同色 + 同色光晕）。
+    // 新消息先完整染一次（含结构），之后每个 chunk 只补新增字符并原地重上色，
+    // 不再往消息上贴元素级渐变兜底，从根上消除「有光/无光交替」的闪烁。
     function paintStreamChunk(mes) {
         if (!mes || !mes.isConnected) return;
         if (settings.enabled === false) return;
-        mes.setAttribute('data-yyx-stream', '1');
+        const sig = structSig();
+        if (mes.dataset.yyx !== '1' || mes.dataset.yyxSig !== sig) {
+            applyMes(mes);
+            return;
+        }
+        paintChars(mes);
     }
 
     // 重新渲染：已染色消息 + 视口附近的未染色消息
     function repaintAll() {
-        // 流式生成期间绝不逐字校正：此时交由元素级渐变 CSS（data-yyx-stream）稳定兜底。
-        // 若在此逐字 wrap，会与每个 chunk 重建的兜底渐变反复交替，表现为「一闪一闪」。
-        // 生成结束（streaming=false）后再统一逐字精确校正。
-        if (streaming) return;
         const c = chat.el;
         if (!c || !c.isConnected) return;
         applying = true;
@@ -890,13 +989,13 @@
                 if (!processed) {
                     const rr = m.getBoundingClientRect();
                     if (rr.width === 0 && rr.height === 0) continue;
-                    if (rr.bottom < -vh || rr.top > vh * 2) continue;
+                    // 流式期间只染屏幕附近的；非流式时只要已染过就全部刷新
+                    if (streaming && rr.bottom < -vh * 0.5) continue;
+                    if (!streaming && (rr.bottom < -vh || rr.top > vh * 2)) continue;
                 }
-                restoreMes(m);
-                applyMes(m);
+                if (streaming) paintStreamChunk(m);
+                else maybeProcess(m);
             }
-            // 仅对「已成功逐字染色」的消息移除流式近似兜底标记，让 CSS 近似色随之失效；
-            // 尚未染色（如布局未就绪被跳过）的消息保留标记，兜底渐变持续生效，避免落回酒馆主题色。
             for (const m of c.querySelectorAll('.mes[data-yyx-stream]')) {
                 if (m.dataset.yyx === '1') m.removeAttribute('data-yyx-stream');
             }
@@ -916,18 +1015,24 @@
     }
 
     // 某一时刻的状态快照：设置、消息标签命中、逐字 span、计算后的 filter/shadow。
+    // 抽样取「最新的两条」消息 —— 真正在屏幕上滚动的就是它们；最早的消息通常在视口外，
+    // 本来就按设计不染色，拿它们做样本会得出「span 数为 0」的假结论。
     function snapshotState() {
         const c = document.getElementById('chat');
-        const items = [...document.querySelectorAll('#chat .mes')].slice(0, 2).map((m, i) => {
+        const all = [...document.querySelectorAll('#chat .mes')];
+        const sample = all.slice(-2);
+        const items = sample.map((m, idx) => {
+            const i = all.length - sample.length + idx;
             const mt = m.querySelector('.mes_text');
             const q = mt ? mt.querySelector('q, blockquote') : null;
             const em = mt ? mt.querySelector('em, i') : null;
-            const sp = m.querySelector('[data-yyx="ch"]');
+            const sp = m.querySelector('[data-yyx="ch"]') || m.querySelector('[data-yyx="sol"]');
             const r = mt && mt.getBoundingClientRect ? mt.getBoundingClientRect() : null;
             return {
                 i,
                 done: m.dataset.yyx === '1',
                 stream: m.hasAttribute('data-yyx-stream'),
+                sig: m.dataset.yyxSig || null,
                 w: r ? Math.round(r.width) : null,
                 h: r ? Math.round(r.height) : null,
                 emTag: em ? em.tagName.toLowerCase() : null,
@@ -941,8 +1046,19 @@
                 qFill: computedOf(q, '-webkit-text-fill-color'),
                 spanShadow: computedOf(sp, 'text-shadow'),
                 spanFill: computedOf(sp, '-webkit-text-fill-color'),
+                spanColor: computedOf(sp, 'color'),
             };
         });
+        // 全局计数：看清「到底有多少条染上了、屏幕附近有没有掉队的」
+        const doneCount = all.filter((m) => m.dataset.yyx === '1').length;
+        const spanTotal = document.querySelectorAll('#chat .mes [data-yyx="ch"]').length;
+        const vh = window.innerHeight || 900;
+        let nearUndone = 0;
+        for (const m of all) {
+            if (m.dataset.yyx === '1') continue;
+            const rr = m.getBoundingClientRect();
+            if (rr.height > 0 && rr.bottom > -vh && rr.top < vh * 2) nearUndone++;
+        }
         return {
             at: new Date().toISOString(),
             streaming,
@@ -950,6 +1066,10 @@
             enabled: settings.enabled !== false,
             strength: { italic: settings.italic && settings.italic.strength, quote: settings.quote && settings.quote.strength },
             glow: { italic: !!(settings.italic && settings.italic.glow), quote: !!(settings.quote && settings.quote.glow) },
+            total: all.length,
+            doneCount,
+            spanTotal,
+            nearUndone,
             items,
         };
     }
@@ -1023,6 +1143,9 @@
 
     function scheduleMes(list, delay = 250) {
         for (const m of list) pendingMes.add(m);
+        // 流式期间必须跟上 chunk 节奏：延迟太长会先露出一段「还没逐字上色」的裸文本，
+        // 而明确要求的观感是从第一个字起就有渐变和光晕，所以这里压到 60ms。
+        if (streaming) delay = Math.min(delay, 60);
         if (!paintTimer) paintTimer = setTimeout(flushPending, delay);
     }
 
@@ -1475,11 +1598,70 @@
 
     function onChange() {
         saveNow();
+        const prevSig = lastSig;
         rev = JSON.stringify(settings);
+        const sig = structSig();
+        lastSig = sig;
         updateStreamCss();
-        updateColorCss(); // 元素级渐变/光晕规则随设置同步刷新（强度、颜色、角度、开关、模式）
-        clearAllSpans();
-        scheduleRepaint(150);
+        updateColorCss(); // 元素级渐变/光晕规则随设置同步刷新（只是给未染色消息的过渡用）
+        if (sig !== prevSig) {
+            // 模式 / 色标 / 角度变了：span 的分组结构必须重建，只能整条重来
+            clearAllSpans();
+            scheduleRepaint(120);
+            return;
+        }
+        // 只改强度 / 光晕开关 / 纯色：结构不变，原地重刷每个 span 的样式。
+        // 绝不拆 span —— 拆了就有一帧「没有逐字颜色也没有光晕」，正是「调强度光晕消失」的来源。
+        scheduleRestyle(60);
+    }
+
+    // 原地重刷：不重建 span，只按新设置重算每个字的颜色与同色光晕。
+    function restyleAll() {
+        const c = chat.el || document.getElementById('chat');
+        if (!c) return;
+        applying = true;
+        try {
+            for (const m of c.querySelectorAll('.mes[data-yyx="1"]')) {
+                if (!m.querySelector('[data-yyx="ch"], [data-yyx="sol"]')) {
+                    // 没有逐字结果（比如被还原过），按常规重新染一次
+                    applyMes(m);
+                    continue;
+                }
+                // 纯色模式或某类改成 theme 时，结构其实变了，走完整重建
+                if (needRebuild(m)) { applyMes(m); continue; }
+                finalizeFromDom(m);
+                m.dataset.yyxRev = rev;
+                m.dataset.yyxSig = structSig();
+            }
+        } finally {
+            applying = false;
+        }
+    }
+
+    // 是否有某一类文字因为模式/色标变化，已经无法沿用现有 span 结构
+    function needRebuild(mes) {
+        const kinds = mes.querySelectorAll('[data-yyx="ch"]');
+        for (const sp of kinds) {
+            const kind = sp.getAttribute('data-k') || 'main';
+            const key = kind === 'em' ? 'italic' : kind === 'quote' ? 'quote' : 'main';
+            const cfg = settings[key];
+            if (!cfg || cfg.mode !== 'gradient') return true;
+        }
+        const mt = mes.querySelector('.mes_text');
+        if (!mt) return true;
+        const s = settings;
+        if (s.italic && s.italic.mode === 'solid' && mt.querySelector('em, i') && !mt.querySelector('em [data-yyx="sol"]')) return true;
+        if (s.quote && s.quote.mode === 'solid' && mt.querySelector('q, blockquote') && !mt.querySelector('q [data-yyx="sol"]')) return true;
+        return false;
+    }
+
+    function scheduleRestyle(ms = 60) {
+        if (restyleTimer) clearTimeout(restyleTimer);
+        restyleTimer = setTimeout(() => {
+            restyleTimer = null;
+            if (applying) return;
+            try { restyleAll(); } catch (e) { console.warn(TAG, 'restyle failed', e); }
+        }, ms);
     }
 
     function refreshAllUI() {
@@ -1591,6 +1773,7 @@
         }
         settings = initSettings();
         rev = JSON.stringify(settings);
+        lastSig = structSig();
         injectCss();
         clearAllSpans();
         registerEvents();
@@ -1616,7 +1799,8 @@
             hexToRgb, rgbToHex, normHex, rgbToHsv, hsvToRgb, hexToHsv, hsvToHex,
             collectText, applyMes, restoreMes, finalizeGroups, applyGradientStyle, paintStreamChunk, repaintAll,
             onChange, updateColorCss, reloadColorCss, scheduleColorReload, buildStreamCss, buildColorCss, debugInfo, snapshotState,
-            _setSettingsForTest: (s) => { settings = s; rev = JSON.stringify(settings); },
+            structSig, finalizeFromDom, paintChars, restyleAll, needRebuild,
+            _setSettingsForTest: (s) => { settings = s; rev = JSON.stringify(settings); lastSig = structSig(); },
             _getSettingsForTest: () => settings,
             _setStreamingForTest: (v) => { streaming = v; },
             _reinitChatForTest: () => { chat.el = document.getElementById('chat'); },
@@ -1627,6 +1811,7 @@
                 if (paintTimer) { clearTimeout(paintTimer); paintTimer = null; }
                 if (repaintTimer) { clearTimeout(repaintTimer); repaintTimer = null; }
                 if (colorCssTimer) { clearTimeout(colorCssTimer); colorCssTimer = null; }
+                if (restyleTimer) { clearTimeout(restyleTimer); restyleTimer = null; }
                 while (snapTimers.length) { clearTimeout(snapTimers.pop()); }
             },
         };
