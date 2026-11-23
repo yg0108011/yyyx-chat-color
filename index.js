@@ -24,7 +24,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.2.11';
+    const VERSION = '1.2.12';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -702,6 +702,10 @@
     let openPickerEl = null;      // 当前展开的取色器
     let openPickerBtn = null;
     const pendingMes = new Set();
+    // v1.2.12：流式全量重建队列。同一帧内多个 MO 批次只合并成一次 rAF 重染，
+    // 避免每个 chunk 都在观察器回调里同步堵一次主线程（长消息单次重建可达数百毫秒）。
+    const streamQueue = new Set();
+    let streamRaf = null;
     const observed = new WeakSet();
     const chat = { el: null, mo: null, io: null, ro: null, cssMo: null };
 
@@ -1321,6 +1325,7 @@
             for (const m of c.querySelectorAll('.mes')) {
                 if (streaming && isLocked(m)) { lock.skips++; continue; } // 流式锁定：不中途升级成逐字
                 const processed = m.dataset.yyx === '1';
+                if (processed && !mesNeedsPaint(m)) continue; // 结构/文字都没变，跳过这次 sweep
                 if (!processed) {
                     const rr = m.getBoundingClientRect();
                     if (rr.width === 0 && rr.height === 0) continue;
@@ -1579,6 +1584,28 @@
     }
 
     // ===== 调度 =====
+    function flushStreamQueue() {
+        streamRaf = null;
+        if (!streamQueue.size) return;
+        applying = true;
+        try {
+            for (const m of streamQueue) {
+                if (!m.isConnected) continue;
+                paintNow(m, false);
+            }
+        } finally {
+            applying = false;
+            streamQueue.clear();
+        }
+    }
+    function queueStream(m) {
+        streamQueue.add(m);
+        if (streamRaf != null) return;
+        // rAF 回调在下一次绘制之前执行，不会露出「先兜底、后逐字」的中间帧；
+        // 同一帧内到达的多个 chunk 合并成一次重建。
+        if (typeof requestAnimationFrame === 'function') streamRaf = requestAnimationFrame(flushStreamQueue);
+        else streamRaf = setTimeout(flushStreamQueue, 16);
+    }
     function flushPending() {
         paintTimer = null;
         const arr = [...pendingMes];
@@ -1688,11 +1715,10 @@
             delete m.dataset.yyx;
             delete m.dataset.yyxRev;
             if (streaming) {
-                // v1.2.7 关键：流式期间仍然逐字染色，且**在 MutationObserver 回调里同步做完**。
-                // MO 回调是微任务，发生在浏览器下一次绘制之前，所以不存在「先看到元素级兜底、
-                // 再跳成逐字色」的中间帧 —— 这也是「首色光晕 ↔ 每字同色光晕」交替闪烁的唯一来源。
-                // 只有连续失败（见 paintNow 的 catch）才退回元素级兜底并锁定到生成结束。
-                paintNow(m, false);
+                // v1.2.12：全量重建并入 rAF 队列，同一帧的多个 chunk 合并成一次；
+                // 不再在观察器回调里同步堵主线程，长消息重建期间翻屏更跟手。
+                // rAF 回调仍在下一次绘制之前执行，不会露出「先兜底、后逐字」的中间帧。
+                queueStream(m);
                 continue;
             }
             deferred.push(m);
@@ -1776,10 +1802,12 @@
         }
         if (!chat.ro) {
             if (typeof ResizeObserver !== 'undefined') {
-                chat.ro = new ResizeObserver(() => { if (anyGradient()) scheduleRepaint(300); });
+                // v1.2.12：流式期间消息高度一直在涨，RO 会被反复触发；流式重染由 MO/队列负责，
+                // 这里再排一次整页 sweep 属于冗余重染，直接跳过。
+                chat.ro = new ResizeObserver(() => { if (!streaming && anyGradient()) scheduleRepaint(300); });
                 chat.ro.observe(c);
             }
-            window.addEventListener('resize', () => { if (anyGradient()) scheduleRepaint(300); });
+            window.addEventListener('resize', () => { if (!streaming && anyGradient()) scheduleRepaint(300); });
         }
     }
 
@@ -1827,6 +1855,8 @@
             // 一条长消息会被整条重染 4~8 次（每次 300~486ms），收尾那一两秒同样看得见闪。
             // 现在只重染一次，后续只做「确实还缺染色」的增量修复（mesNeedsPaint 会跳过已完成项）。
             clearStreamLocks();
+            // 收尾前先把 rAF 队列里积压的重建 flush 掉，避免结束后还留一条兜底帧
+            flushStreamQueue();
             if (wasStreaming || anyGradient()) {
                 try { repaintAll(); } catch (e) { console.warn(TAG, 'final repaint failed', e); }
                 fastPaintBurst();
@@ -2382,6 +2412,12 @@
                 if (repaintTimer) { clearTimeout(repaintTimer); repaintTimer = null; }
                 if (colorCssTimer) { clearTimeout(colorCssTimer); colorCssTimer = null; }
                 if (restyleTimer) { clearTimeout(restyleTimer); restyleTimer = null; }
+                if (streamRaf != null) {
+                    if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(streamRaf);
+                    else clearTimeout(streamRaf);
+                    streamRaf = null;
+                }
+                streamQueue.clear();
                 if (flicker.raf && typeof cancelAnimationFrame === 'function') { cancelAnimationFrame(flicker.raf); flicker.raf = null; }
                 stopGuard();
                 while (burstTimers.length) { clearTimeout(burstTimers.pop()); }
