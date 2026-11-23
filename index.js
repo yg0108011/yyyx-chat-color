@@ -1,5 +1,5 @@
 /*!
- * 聊天文字调色 v1.1.21
+ * 聊天文字调色 v1.1.22
  * SillyTavern UI 扩展
  *
  * 功能：
@@ -23,7 +23,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.1.21';
+    const VERSION = '1.1.22';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -152,8 +152,8 @@
     // 避免「稍微调低就完全看不见光晕」；满档 s=1 与无光 s=0 口径保持不变。
     function glowEase(s) {
         return {
-            r: Math.pow(s, 0.65),          // 半径：低段衰减慢于线性
-            a: 0.22 + 0.78 * s,            // 透明度：最低保留 22% 基准辉光
+            r: Math.pow(s, 0.5),           // 半径：平方根曲线，低段衰减更慢，保留扩散范围
+            a: 0.38 + 0.62 * s,            // 透明度：低段保留 38% 基准辉光，避免深背景下被吞掉
         };
     }
 
@@ -594,7 +594,8 @@
         sc.textContent = buildColorCss(settings);
     }
 
-    // 消息 DOM 被酒馆重建后兜底：清理历史染色 span 并强制重载配色样式（防抖）
+    // 消息 DOM 被酒馆重建后兜底：清理历史染色 span、强制重载配色样式，并重新逐字染色（防抖）。
+    // 注意：拆 span 后必须补一次逐字重染，否则会退回纯文本 + 元素级 filter，丢掉每字同色光晕。
     function scheduleColorReload(ms = 250) {
         if (typeof document === 'undefined') return;
         if (colorCssTimer) clearTimeout(colorCssTimer);
@@ -602,6 +603,7 @@
             colorCssTimer = null;
             clearAllSpans();
             reloadColorCss();
+            scheduleRepaint(50);
         }, ms);
     }
 
@@ -613,7 +615,9 @@
         if (!es || typeof es.on !== 'function') return;
         const on = (name, fn) => { if (et[name]) es.on(et[name], fn); };
         on('GENERATION_STARTED', () => { streaming = true; });
-        const endStream = () => { streaming = false; scheduleColorReload(120); };
+        // 结束后的逐字校正由 registerEvents 的 endStream（scheduleRepaint）负责；
+        // 这里只轻量刷新元素级规则，不拆逐字 span，避免把每字同色光晕拆掉退回纯文本。
+        const endStream = () => { streaming = false; updateColorCss(); };
         on('GENERATION_ENDED', endStream);
         on('GENERATION_STOPPED', endStream);
         on('MESSAGE_EDITED', () => scheduleColorReload(200));
@@ -900,6 +904,37 @@
         }
     }
 
+    // 诊断信息：挂到 window.__yyyx.debug()，便于在真机 F12 排查「结束后无光」。
+    // 只读当前设置、消息标签命中、逐字 span 数与内联 shadow、两张配色表规则，不改动 DOM。
+    function debugInfo() {
+        const pick = (els) => [...els].slice(0, 2).map((el) => {
+            const ch = el.querySelector('[data-yyx="ch"]');
+            return {
+                tag: el.tagName.toLowerCase(),
+                spanCount: el.querySelectorAll('[data-yyx="ch"]').length,
+                shadow: ch ? ch.style.textShadow || null : null,
+                fill: ch ? ch.style.getPropertyValue('-webkit-text-fill-color') || null : null,
+                text: el.textContent.slice(0, 24),
+            };
+        });
+        const messages = [...document.querySelectorAll('#chat .mes')].slice(0, 5).map((m, i) => ({
+            i,
+            done: m.dataset.yyx === '1',
+            stream: m.hasAttribute('data-yyx-stream'),
+            em: pick(m.querySelectorAll('em, i')),
+            quote: pick(m.querySelectorAll('q, blockquote')),
+        }));
+        const table = (id) => { const t = document.getElementById(id); return t ? t.textContent.slice(0, 500) : null; };
+        return {
+            version: VERSION,
+            streaming,
+            settings: TARGET_KEYS.reduce((o, k) => { o[k] = settings[k]; return o; }, {}),
+            messages,
+            colorCss: table('yyyx-color'),
+            streamCss: table('yyyx-stream'),
+        };
+    }
+
     // ===== 调度 =====
     function flushPending() {
         paintTimer = null;
@@ -1033,6 +1068,9 @@
             if (chat.el) chat.el.classList.remove('yyx-streaming');
             if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; }
             scheduleRepaint(16); // 尽快按真实位置精确校正；期间 CSS 近似兜底持续生效，无原生色窗口
+            // 二次补染：首帧 16ms 时刚收尾的消息布局可能尚未就绪（宽高为 0 被跳过），
+            // 延迟到布局稳定后再重染一遍，避免这类消息停留在纯文本 + 弱兜底光、看起来「结束就无光」。
+            scheduleRepaint(350);
         };
         on('GENERATION_ENDED', endStream);
         on('GENERATION_STOPPED', endStream);
@@ -1473,6 +1511,7 @@
         injectCss();
         clearAllSpans();
         registerEvents();
+        try { window.__yyyx = { version: VERSION, debug: debugInfo, getSettings: () => settings }; } catch { /* 无 window 环境忽略 */ }
         console.log(`${TAG} v${VERSION} 已加载`);
         initChatHooks();
         uiTimerId = setInterval(() => {
@@ -1493,7 +1532,7 @@
             gradientTextCss, glowFilter, targetDecl, buildColorCss, clearAllSpans,
             hexToRgb, rgbToHex, normHex, rgbToHsv, hsvToRgb, hexToHsv, hsvToHex,
             collectText, applyMes, restoreMes, finalizeGroups, applyGradientStyle, paintStreamChunk, repaintAll,
-            onChange, updateColorCss,
+            onChange, updateColorCss, reloadColorCss, scheduleColorReload, buildStreamCss, buildColorCss, debugInfo,
             _setSettingsForTest: (s) => { settings = s; rev = JSON.stringify(settings); },
             _getSettingsForTest: () => settings,
             _setStreamingForTest: (v) => { streaming = v; },
