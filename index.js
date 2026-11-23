@@ -1,5 +1,5 @@
 /*!
- * 聊天文字调色 v1.1.24
+ * 聊天文字调色 v1.2.6
  * SillyTavern UI 扩展
  *
  * 功能：
@@ -15,15 +15,16 @@
  *
  * 性能设计：
  * - 逐字染色按需触发（设置变化 / 生成结束 / 进入视口），每字同色 text-shadow 不创建合成层；
- *   流式期间以元素级渐变（background-clip:text）完整兜底（含渐变与光晕），
- *   生成结束后自动逐字精确校正为每字同色光晕；外部改动消息 DOM 时自动重新染色。
+ *   流式期间「锁定」为元素级渐变（background-clip:text）+ text-shadow 光晕这一种呈现，
+ *   期间任何渲染路径都不升级成逐字 span（避免「兜底 ↔ 逐字」来回切造成闪烁）；
+ *   生成结束后统一解锁并做唯一一次逐字精确重建；外部改动消息 DOM 时自动重新染色。
  */
 (() => {
     'use strict';
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.2.5';
+    const VERSION = '1.2.6';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -440,11 +441,43 @@
     const flicker = {
         raf: null, frames: 0, bareFrames: 0, bareLastAt: null, bareLastLen: null,
         sync: 0, deferred: 0, fail: 0, lastMs: 0, maxMs: 0, reason: {},
+        // v1.2.6：这两项直接量化用户抱怨的「两种呈现来回切」。
+        // fallbackFrames = 尾条消息处于「元素级兜底」的帧数（按设计允许，流式全程应如此）
+        // switches = 尾条消息在「兜底」与「逐字 span」之间来回切换的次数（目标必须是 0）
+        fallbackFrames: 0, switches: 0, lastMode: null,
         reset() {
             this.frames = 0; this.bareFrames = 0; this.bareLastAt = null; this.bareLastLen = null;
             this.sync = 0; this.deferred = 0; this.fail = 0; this.lastMs = 0; this.maxMs = 0; this.reason = {};
+            this.fallbackFrames = 0; this.switches = 0; this.lastMode = null;
         },
     };
+
+    // v1.2.6「流式锁定」：流式期间正在生成的那条消息只允许一种呈现（元素级渐变 + 光晕），
+    // 绝不中途升级成逐字 span。任何一条渲染路径（MO / 定时排程 / 守护帧 / 一次性修复 / 全量重染）
+    // 命中带 data-yyx-stream 标记的消息都直接跳过，从结构上消灭「兜底 ↔ 逐字」来回切换。
+    const lock = { marked: 0, skips: 0 };
+
+    function isLocked(m) {
+        return !!(m && m.hasAttribute && m.hasAttribute('data-yyx-stream'));
+    }
+
+    function lockTarget(m) {
+        if (!m || isLocked(m)) return false;
+        m.setAttribute('data-yyx-stream', '1');
+        lock.marked++;
+        note('lock', (m.querySelector('.mes_text') || {}).textContent ? 'text' : 'empty');
+        return true;
+    }
+
+    function clearStreamLocks() {
+        let n = 0;
+        for (const m of document.querySelectorAll('#chat .mes[data-yyx-stream]')) {
+            m.removeAttribute('data-yyx-stream');
+            n++;
+        }
+        if (n) note('unlock', n);
+        return n;
+    }
 
     function lastMes() {
         const c = chat.el || document.getElementById('chat');
@@ -461,11 +494,24 @@
             const mt = m.querySelector('.mes_text');
             const hasText = mt && (mt.textContent || '').trim().length > 0;
             const painted = m.dataset.yyx === '1' && !!m.querySelector('[data-yyx="ch"], [data-yyx="sol"]');
-            if (hasText && !painted) {
-                flicker.bareFrames++;
-                flicker.bareLastAt = new Date().toISOString();
-                flicker.bareLastLen = (mt.textContent || '').length;
-                flicker.reason.bare = (flicker.reason.bare || 0) + 1;
+            const mode = !hasText ? null : (painted ? 'span' : 'fallback');
+            if (mode) {
+                if (mode === 'fallback') {
+                    // 流式期间锁定后「兜底」是唯一合法呈现，不算裸状态，只记帧数
+                    if (isLocked(m)) flicker.fallbackFrames++;
+                    else {
+                        flicker.bareFrames++;
+                        flicker.bareLastAt = new Date().toISOString();
+                        flicker.bareLastLen = (mt.textContent || '').length;
+                        flicker.reason.bare = (flicker.reason.bare || 0) + 1;
+                    }
+                }
+                // 呈现形态来回切换 = 肉眼看到的「一亮一暗」；这个计数必须为 0
+                if (flicker.lastMode && flicker.lastMode !== mode) {
+                    flicker.switches++;
+                    flicker.reason.switch = (flicker.reason.switch || 0) + 1;
+                }
+                flicker.lastMode = mode;
             }
         }
         flicker.raf = (typeof requestAnimationFrame === 'function')
@@ -544,8 +590,9 @@
         let fixed = 0;
         for (const m of tailMes(3)) {
             if (!m.isConnected) continue;
-            const r = m.getBoundingClientRect();
-            if (r.bottom < -vh * 0.5) continue;
+            if (isLocked(m)) { lock.skips++; continue; } // 流式锁定：只保留元素级兜底，不中途升级
+            const r2 = m.getBoundingClientRect();
+            if (r2.bottom < -vh * 0.5) continue;
             if (!mesNeedsPaint(m)) continue;
             const mt = m.querySelector('.mes_text');
             guard.lastFixChars = mt ? (mt.textContent || '').length : 0;
@@ -578,6 +625,7 @@
         let fixed = 0;
         for (const m of tailMes(40)) {
             if (!m.isConnected) continue;
+            if (isLocked(m)) { lock.skips++; continue; } // 流式锁定：交给元素级兜底
             const rr = m.getBoundingClientRect();
             if (rr.width === 0 && rr.height === 0) continue;
             if (rr.bottom < -vh || rr.top > vh * 2) continue;
@@ -1233,6 +1281,7 @@
         try {
             const vh = window.innerHeight || 900;
             for (const m of c.querySelectorAll('.mes')) {
+                if (streaming && isLocked(m)) { lock.skips++; continue; } // 流式锁定：不中途升级成逐字
                 const processed = m.dataset.yyx === '1';
                 if (!processed) {
                     const rr = m.getBoundingClientRect();
@@ -1382,7 +1431,14 @@
                 lastPaintMs: flicker.lastMs,
                 maxPaintMs: flicker.maxMs,
                 reasons: flicker.reason,
+                // v1.2.6：流式期间「兜底」是唯一合法呈现；fallbackFrames 应≈frames，
+                // switches（兜底↔逐字来回切）必须是 0，>0 就说明还在闪。
+                fallbackFrames: flicker.fallbackFrames,
+                modeSwitches: flicker.switches,
             },
+            // 流式锁定：marked = 这一轮被锁定（保持元素级兜底）的消息数，
+            // skips = 各条渲染路径因为锁定而跳过的次数（它替我们挡掉了多少次整条重建）
+            lock: { marked: lock.marked, skips: lock.skips, lockedNow: document.querySelectorAll('#chat .mes[data-yyx-stream]').length },
             lastMes: last ? (() => {
                 const mt = last.querySelector('.mes_text');
                 const sp = last.querySelector('[data-yyx="ch"]');
@@ -1400,6 +1456,12 @@
                     lagChars: cache ? total - cache.total : null,
                     // 真正生效的光晕（不是我们写进去的字符串）：none 就说明这一帧肉眼看不到光
                     glowNow: sp ? (computedOf(sp, 'text-shadow') || 'none') : null,
+                    // 流式兜底态没有 span，这时光晕要看 .mes_text 自己生效的 text-shadow
+                    mesShadow: (() => {
+                        const s = computedOf(mt, 'text-shadow');
+                        return s ? s.slice(0, 80) : 'none';
+                    })(),
+                    mesFill: computedOf(mt, '-webkit-text-fill-color'),
                     syncLimit: SYNC_PAINT_MAX_CHARS,
                 };
             })() : null,
@@ -1465,7 +1527,8 @@
         applying = true;
         try {
             for (const m of arr) {
-                if (streaming) paintStreamChunk(m); // 流式期间增量上色，结束后统一校正
+                if (streaming && isLocked(m)) { lock.skips++; continue; } // 流式锁定：只保留兜底
+                if (streaming) paintStreamChunk(m); // 非锁定消息流式期间增量上色
                 else maybeProcess(m);
             }
         } finally {
@@ -1474,15 +1537,15 @@
     }
 
     function scheduleMes(list, delay = 250) {
-        for (const m of list) pendingMes.add(m);
-        // v1.3.0：流式期间不再"每个 chunk 补染一次"。
-        // 真机实测一条 2500 字的消息整条重建要 200~426ms（perf.maxMs 426），
-        // 而酒馆每个 chunk 都会整段重写正文、把我们逐字 span 全部抹掉，
-        // 于是每 0.6 秒就要重建一次、每次卡住两三百毫秒 —— 期间画面掉回元素级兜底，
-        // 长消息就是持续的一亮一暗。现在改成：流式期间交给元素级兜底（已改为 text-shadow 发光，
-        // 外观与逐字版接近），只在「静默 1.2 秒」或生成结束时做一次精确重建。
+        // v1.2.6：流式期间被锁定的消息一律不排队 —— 它们在生成结束前保持元素级兜底，
+        // 这样「静默超过 1.2 秒」也不会突然升级成逐字 span、下一个 chunk 又被打回兜底（就是闪烁本身）。
+        for (const m of list) {
+            if (streaming && isLocked(m)) { lock.skips++; continue; }
+            pendingMes.add(m);
+        }
         if (streaming) delay = Math.max(delay, 1200);
         if (paintTimer) { clearTimeout(paintTimer); paintTimer = null; }
+        if (!pendingMes.size) return; // 全被锁定跳过：不排一个空定时器
         paintTimer = setTimeout(flushPending, delay);
     }
 
@@ -1537,6 +1600,7 @@
         if (!targets.size) return;
         mutCount++;
         lastMutAt = Date.now();
+        if (streaming) armStreamTimer(); // 心跳：真在吐字就别让 120s 兜底误触发
         note('mut', targets.size);
         const deferred = [];
         for (const m of targets) {
@@ -1550,6 +1614,9 @@
                 continue;
             }
             observeMes(m);
+            // v1.2.6：已锁定的消息在生成结束前不再接受任何染色（它已经是元素级兜底），
+            // 这是「不闪」的结构性保证 —— 中途升级成逐字 span 再被下一个 chunk 打回，就是闪烁。
+            if (streaming && isLocked(m)) { lock.skips++; continue; }
             // 结构还在（span 未被抹掉，只是文字增加了）：保留标记，走增量，已有 span 原地复用。
             // 增量补染只花 2~3ms（实测），继续保留。
             if (hasSpans && streaming && syncPaintable(m)) {
@@ -1561,13 +1628,10 @@
             delete m.dataset.yyx;
             delete m.dataset.yyxRev;
             if (streaming) {
-                // v1.3.0 关键改动：流式期间「整条重建」不再同步执行。
-                // 酒馆每个 chunk 都会整段重写正文、把 span 全抹掉，长消息整条重建要 200~426ms，
-                // 同步做就是每 0.6 秒卡一次、画面在「有光/无光」之间来回 —— 这正是长消息的闪烁。
-                // 现在立刻退回元素级兜底（已是渐变 + text-shadow 发光，肉眼与逐字版接近），
-                // 精确重建交给「静默 1.2 秒」或生成结束，最多只有一次、且在静止画面里完成。
-                m.setAttribute('data-yyx-stream', '1');
-                deferred.push(m);
+                // 正文被整段重写：立刻锁定为「元素级渐变 + 光晕」这一种呈现，并持续到生成结束。
+                // 不再同步重建（实测整条重建 197~486ms，每次都让画面掉一次档 = 长消息闪烁）。
+                // 结束（GENERATION_ENDED / STOPPED）时统一解锁并做唯一一次精确逐字重建。
+                lockTarget(m);
                 continue;
             }
             deferred.push(m);
@@ -1654,6 +1718,20 @@
     }
 
     // ===== 事件注册 =====
+    // 120 秒「ENDED 事件丢了」兜底。每次收到新 chunk 都重置（见 onChatMutation），
+    // 否则超长回复会在生成到一半时被误判结束 —— 解锁 + 重建 = 一次可见的闪。
+    function armStreamTimer() {
+        if (streamTimer) clearTimeout(streamTimer);
+        streamTimer = setTimeout(() => {
+            streamTimer = null;
+            if (!streaming) return;
+            streaming = false;
+            if (chat.el) chat.el.classList.remove('yyx-streaming');
+            clearStreamLocks();
+            scheduleRepaint(400);
+        }, 120000);
+    }
+
     function registerEvents() {
         const es = ctx && ctx.eventSource;
         const et = (ctx && ctx.event_types) || {};
@@ -1663,28 +1741,30 @@
         on('GENERATION_STARTED', () => {
             streaming = true;
             flicker.reset();
+            lock.marked = 0; lock.skips = 0;
+            // 清掉上一轮可能残留的锁定标记（例如 STOPPED 事件丢了），否则那条消息会一直停在兜底
+            clearStreamLocks();
             startProbe();
             guard.frames = 0; guard.fixes = 0; guard.lastFixAt = 0;
             startGuard();
             if (chat.el) chat.el.classList.add('yyx-streaming'); // 流式类：未染色消息立即命中元素级渐变兜底
-            if (streamTimer) clearTimeout(streamTimer);
-            streamTimer = setTimeout(() => {
-                streamTimer = null;
-                if (streaming) { streaming = false; if (chat.el) chat.el.classList.remove('yyx-streaming'); scheduleRepaint(400); }
-            }, 120000); // 兜底：万一 ENDED 事件丢失
+            armStreamTimer();
         });
         const endStream = () => {
+            const wasStreaming = streaming;
             streaming = false;
             stopGuard();
             if (chat.el) chat.el.classList.remove('yyx-streaming');
             if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; }
-            scheduleRepaint(16); // 尽快按真实位置精确校正；期间 CSS 近似兜底持续生效，无原生色窗口
-            // 二次、三次补染：首帧 16ms 时刚收尾的消息布局可能尚未就绪（宽高为 0 被跳过），
-            // 手机端布局更慢，延迟再重染两遍，避免这类消息停留在纯文本 + 弱兜底光。
-            scheduleRepaint(350);
-            scheduleRepaint(1200);
-            // 再做一次「只补缺的」快速修复：漏掉的引号/斜体段、被拦在视口边缘的消息都能补上
-            fastPaintBurst();
+            if (repaintTimer) { clearTimeout(repaintTimer); repaintTimer = null; }
+            // 解锁 → 唯一一次精确重建。v1.2.6 之前这里是 3 次全量重染 + 一轮连打，
+            // 一条长消息会被整条重染 4~8 次（每次 300~486ms），收尾那一两秒同样看得见闪。
+            // 现在只重染一次，后续只做「确实还缺染色」的增量修复（mesNeedsPaint 会跳过已完成项）。
+            clearStreamLocks();
+            if (wasStreaming || anyGradient()) {
+                try { repaintAll(); } catch (e) { console.warn(TAG, 'final repaint failed', e); }
+                fastPaintBurst();
+            }
             recordEndSnapshots();
         };
         on('GENERATION_ENDED', endStream);
@@ -2265,6 +2345,14 @@
             },
             _repairVisibleForTest: (tag) => repairVisible(tag),
             _mesNeedsPaintForTest: (m) => mesNeedsPaint(m),
+            // v1.2.6 测试钩子：模拟「生成结束 → 解锁 → 唯一一次精确重建」的服务端流程
+            _endStreamForTest: () => {
+                streaming = false;
+                stopGuard();
+                if (repaintTimer) { clearTimeout(repaintTimer); repaintTimer = null; }
+                clearStreamLocks();
+                repaintAll();
+            },
         };
     }
 
