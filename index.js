@@ -24,7 +24,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.2.8';
+    const VERSION = '1.2.9';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -86,10 +86,13 @@
         layer1: [{ radius: 6, alpha: 0.85 }],
     };
 
-    // 引号对 / 斜体对这类「按字符顺序线性取色」的单元，末端固定保留多少个字落在尾色上。
-    // 长短单元（一百多字的对话 vs 三四十字的斜体）结尾因此会是同一个蓝，而不是「长的那个
-    // 一路白、最后两个字才刚发蓝」。（上限 18% 保证短单元不会被压成一整条纯色。）
-    const ORDER_END_HOLD = 8;
+    // ===== 渐变可视终点（对齐「雨夜回响」主题的观感）=====
+    // 主题里 q / 名字 / 顶栏都是把 linear-gradient 铺在元素整个盒子宽度上，而文字只占盒子左侧
+    // 大约八成，所以真实渲染中文字永远读不到满值的尾色（粉蓝的 #a8d8ff），只呈现
+    // 「首色 → 白 → 极淡的冷白」。插件过去把一整个渐变循环压在文字的实际宽度上，
+    // 末字必然打到满值尾色，于是同一组色标看起来明显更蓝、更艳（用户反馈「蓝色太蓝」）。
+    // 现在逐字取色同样只走完色标的前 STOP_REACH 段：尾字落在中途色，而不是满值尾色。
+    const STOP_REACH = 0.8;
 
     // ===== 颜色工具 =====
     function hexToRgb(hex) {
@@ -1051,16 +1054,12 @@
                 if (item.order) {
                     // 每个引号内对话 / 每对 *xxx* 独立循环：按字符顺序线性取色（首→尾），
                     // 不走空间投影，避免跨行方向反转。
-                    // v1.2.8：末端「保色」—— 无论单元多长，最后若干字都落在尾色上。
-                    // 之前纯线性时，100 多字的引号只有最后 1~2 个字真的到 #a8d8ff，肉眼看到的
-                    // 是「一路白到结尾」，而几十字的斜体最后 8 个字都是蓝的 —— 同一条消息里
-                    // 两种「蓝」看起来就不一样。这里把最后一小段压成尾色，让长短单元结尾同色。
-                    const hold = Math.min(0.18, ORDER_END_HOLD / n);
-                    const denom = 1 - hold;
+                    // v1.2.9：去掉 v1.2.8 的「末端保色」（最后 8 字压成满值尾色会在长引用尾部
+                    // 铺出一条实色蓝带，是「蓝色太蓝」的主要来源），并让整段只走完色标前
+                    // STOP_REACH 段 —— 与雨夜回响主题里「文字没走完整个渐变色盒」一致。
                     for (let i = 0; i < n; i++) {
                         const t = (n === 1) ? 0 : i / (n - 1);
-                        const T = denom > 1e-6 ? Math.min(1, t / denom) : t;
-                        applySpan(spans[i], colorAt(stops, T), strength);
+                        applySpan(spans[i], colorAt(stops, t * STOP_REACH), strength);
                     }
                     continue;
                 }
@@ -1083,7 +1082,7 @@
                     if (!hasBox) T = (n === 1) ? 0 : i / (n - 1);
                     else if (span2 < 1e-6) T = 0;
                     else T = Math.min(1, Math.max(0, (ts[i] - tmin) / span2));
-                    applySpan(spans[i], colorAt(stops, T), strength);
+                    applySpan(spans[i], colorAt(stops, T * STOP_REACH), strength);
                 }
             }
         }
@@ -1508,6 +1507,7 @@
                     glowSpans,
                     blurSumPx: Math.round(blurSum),
                     glowMode: glowMode,
+                    stopReach: STOP_REACH,
                     lastMesHeight: last ? Math.round(last.getBoundingClientRect().height) : null,
                 };
             })(),
