@@ -24,7 +24,7 @@
 
     // ===== 基础常量 =====
     const MODULE = 'yyyx_chat_color';
-    const VERSION = '1.2.12';
+    const VERSION = '1.2.13';
     const TAG = '[聊天文字调色]';
     const TARGET_KEYS = ['main', 'italic', 'quote'];
     const TARGET_LABELS = { main: '主要文本', italic: '斜体文本', quote: '引用文本' };
@@ -1053,6 +1053,62 @@
         paintGradient(el, cfg, granularity, groups, extraSkip);
     }
 
+    // 纯文本引号兜底：酒馆并非把每一对引号都包成 <q>/<blockquote>，
+    // 没包的对话留在 <p> 纯文本里，旧逻辑只认宿主标签，这部分引号就一直是白底。
+    // 这里直接在纯文本节点上按引号对分段染色，叙述文字保留原色；开合状态按消息延续，
+    // 跨段落的未闭合引号不会断档。
+    const PLAIN_QSTATE = new WeakMap();
+    function paintPlainQuotes(root, cfg, groups) {
+        if (!root || !cfg || cfg.mode === 'theme') return;
+        const stops = stopsOf(cfg);
+        let key = groups.get(root);
+        if (!key) { key = new Map(); groups.set(root, key); }
+        let state = PLAIN_QSTATE.get(root) || { inQuote: false, closer: null, cur: null };
+        let gid = Number(root.dataset.yyxPlainG || 0) || 0;
+        const getList = (g) => {
+            let L = key.get(g);
+            if (!L) { L = { spans: [], cfg, stops, order: true }; key.set(g, L); }
+            return L;
+        };
+        const extraSkip = 'em, i, q, blockquote, code, pre, [data-yyx="ch"], [data-yyx="sol"]';
+        for (const n of collectText(root, extraSkip)) {
+            if (!n.nodeValue.trim()) continue;
+            const chars = graphemes(n.nodeValue || '');
+            if (!chars.length) continue;
+            const r = quoteSegments(chars, gid, state);
+            state = r.state; gid = r.gid;
+            const frag = document.createDocumentFragment();
+            let plain = '';
+            const flushPlain = () => { if (plain) { frag.appendChild(document.createTextNode(plain)); plain = ''; } };
+            for (let i = 0; i < chars.length; i++) {
+                const g = r.segs[i];
+                if (g == null) { plain += chars[i]; continue; }
+                flushPlain();
+                const sp = document.createElement('span');
+                if (cfg.mode === 'solid') {
+                    sp.className = 'yyx-sol';
+                    sp.setAttribute('data-yyx', 'sol');
+                    sp.setAttribute('data-k', 'quote');
+                    sp.style.setProperty('color', cfg.color, 'important');
+                    sp.style.setProperty('-webkit-text-fill-color', cfg.color, 'important');
+                    sp.style.setProperty('text-shadow', 'none', 'important');
+                } else {
+                    sp.className = 'yyx-ch';
+                    sp.setAttribute('data-yyx', 'ch');
+                    sp.setAttribute('data-k', 'quote');
+                    sp.setAttribute('data-g', String(g));
+                    getList(g).spans.push(sp);
+                }
+                sp.textContent = chars[i];
+                frag.appendChild(sp);
+            }
+            flushPlain();
+            n.parentNode.replaceChild(frag, n);
+        }
+        root.dataset.yyxPlainG = String(gid);
+        PLAIN_QSTATE.set(root, state);
+    }
+
     // 每个 span 上一次写入的样式缓存：流式每来一个 chunk 都要重算整条消息的取色，
     // 若每次都全量写 DOM，手机端会明显抖动；这里只写「颜色真的变了」的那几个字。
     const SPAN_CACHE = new WeakMap();
@@ -1146,6 +1202,9 @@
         // v1.2.11：引号开合状态一并作废。整段重建后若沿用上一帧残留的 inQuote 状态，
         // 新引号会被误判成闭引号，分段/组号在帧之间漂移，尾字取色位置随之粉↔蓝振荡。
         for (const q of mes.querySelectorAll('q, blockquote')) QSTATE.delete(q);
+        // 纯文本引号兜底的开合状态与组号一并作废
+        const mt0 = mes.querySelector('.mes_text');
+        if (mt0) { PLAIN_QSTATE.delete(mt0); delete mt0.dataset.yyxPlainG; }
     }
 
     const MES_SIG = new WeakMap();   // 消息上次染完时的纯文本指纹（用于忽略自己写入产生的 DOM 回声）
@@ -1252,6 +1311,8 @@
             if (q.closest('code, pre')) continue;
             paintTargetEl(q, s.quote, dummy, 'quote');
         }
+        // 没被包成 q/blockquote 的纯文本引号对话，按引号对兜底染色
+        paintPlainQuotes(mt, s.quote, dummy);
         paintTargetEl(mt, s.main, dummy, 'message', 'em, i, q, blockquote');
         finalizeFromDom(mes);
         mes.removeAttribute('data-yyx-stream');
@@ -1284,6 +1345,8 @@
             if (q.closest('code, pre')) continue;
             paintTargetEl(q, s.quote, groups, 'quote');
         }
+        // 没被包成 q/blockquote 的纯文本引号对话，按引号对兜底染色
+        paintPlainQuotes(mt, s.quote, groups);
         paintTargetEl(mt, s.main, groups, 'message', 'em, i, q, blockquote');
         finalizeGroups(groups);
         mes.removeAttribute('data-yyx-stream');
@@ -1442,15 +1505,26 @@
         });
         // 同样只抽样「最新的几条」，最早的消息在视口外本来就按设计不染色
         const all = [...document.querySelectorAll('#chat .mes')];
-        const messages = all.slice(-4).map((m, idx) => ({
-            i: all.length - 4 + idx,
-            done: m.dataset.yyx === '1',
-            stream: m.hasAttribute('data-yyx-stream'),
-            chars: ((m.querySelector('.mes_text') || {}).textContent || '').length,
-            spans: m.querySelectorAll('[data-yyx="ch"], [data-yyx="sol"]').length,
-            em: pick(m.querySelectorAll('em, i')),
-            quote: pick(m.querySelectorAll('q, blockquote')),
-        }));
+        const hostInfo = (el) => {
+            const hsp = el.querySelectorAll('[data-yyx="ch"], [data-yyx="sol"]').length;
+            return { tag: el.tagName.toLowerCase(), n: hsp, text: el.textContent.slice(0, 24) };
+        };
+        const messages = all.slice(-4).map((m, idx) => {
+            const hosts = [...m.querySelectorAll('em, i, q, blockquote')];
+            const zeroHosts = hosts.filter(h => h.querySelectorAll('[data-yyx="ch"], [data-yyx="sol"]').length === 0).map(hostInfo);
+            return {
+                i: all.length - 4 + idx,
+                done: m.dataset.yyx === '1',
+                stream: m.hasAttribute('data-yyx-stream'),
+                chars: ((m.querySelector('.mes_text') || {}).textContent || '').length,
+                spans: m.querySelectorAll('[data-yyx="ch"], [data-yyx="sol"]').length,
+                hostTotal: hosts.length,
+                hostPainted: hosts.length - zeroHosts.length,
+                zeroHosts: zeroHosts.slice(0, 10),
+                em: pick(m.querySelectorAll('em, i')),
+                quote: pick(m.querySelectorAll('q, blockquote')),
+            };
+        });
         const table = (id) => { const t = document.getElementById(id); return t ? t.textContent.slice(0, 300) : null; };
         const c = document.getElementById('chat');
         const last = all.length ? all[all.length - 1] : null;
@@ -1490,11 +1564,11 @@
                 const cache = PAINT_CACHE.get(last);
                 const total = (mt ? mt.textContent : '').length;
                 const spans = last.querySelectorAll('[data-yyx="ch"], [data-yyx="sol"]').length;
-                // v1.2.11：列出前 6 个斜体/引用宿主的 span 数与首/尾字颜色，
+                // v1.2.11：列出斜体/引用宿主的 span 数与首/尾字颜色，
                 // 用来判断振荡到底是「整段一个渐变」还是「每行一个渐变」，以及兜底 CSS 是否透出。
                 const hosts = [];
                 if (mt) {
-                    for (const el of [...mt.querySelectorAll('em, i, q, blockquote')].slice(0, 6)) {
+                    for (const el of [...mt.querySelectorAll('em, i, q, blockquote')].slice(0, 40)) {
                         const hsp = [...el.querySelectorAll('[data-yyx="ch"]')];
                         const hfill = (s) => s.style.getPropertyValue('-webkit-text-fill-color') || s.style.color || null;
                         hosts.push({
@@ -1505,6 +1579,13 @@
                             fill: computedOf(el, '-webkit-text-fill-color'),
                             text: el.textContent.slice(0, 16),
                         });
+                    }
+                }
+                // 还停留在纯文本节点里、没被任何宿主或 span 包住的引号片段（兜底染色的目标）
+                const bareQuotes = [];
+                if (mt) {
+                    for (const n of collectText(mt, 'em, i, q, blockquote, code, pre, [data-yyx="ch"], [data-yyx="sol"]')) {
+                        if (/[“「『"]/.test(n.nodeValue || '')) bareQuotes.push((n.nodeValue || '').trim().slice(0, 24));
                     }
                 }
                 return {
@@ -1527,6 +1608,7 @@
                     syncLimit: SYNC_PAINT_MAX_CHARS,
                     html: mt ? mt.innerHTML.slice(0, 1200) : null,
                     hosts,
+                    bareQuotes: bareQuotes.slice(0, 10),
                 };
             })() : null,
             // 观察器健康度：容器是否被酒馆重建、观察器是否还挂在活节点上
